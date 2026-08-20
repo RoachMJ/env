@@ -29,19 +29,19 @@ No `git clone` by hand needed — `install.sh` detects piped execution and clone
 1. **Run the one-liner.**
 
    ```bash
-   curl -fsSL https://github.com/RoachMJ/env/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/RoachMJ/env/main/install.sh | bash
    ```
 
-   (e.g. `https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/env-config-bootstrap/main/install.sh` once you've pushed this repo — swap in your real path. Note there's no `/env/` in the URL — this repo's own root is `install.sh`, lib/, etc. directly, the same way env-personal/ and env-professional/ are each just their own repo's root.)
+   This has to be a `raw.githubusercontent.com` URL, not a regular `github.com/.../blob/...` one — the latter returns an HTML page, not the script itself, which `bash` can't do anything useful with. `install.sh` already defaults `BOOTSTRAP_REPO_URL` to `https://github.com/RoachMJ/env.git` internally (this repo is public — no auth needed to clone it), so the plain one-liner above works with nothing extra. Forking this for your own dotfiles? Swap in your own raw URL and see step 4 below to also override the clone URL baked into the script.
 
 2. **It clones itself to disk.** Creates ~/.env-config (a hidden folder in your home directory, override with ENVCFG_HOME=...) if it doesn't exist yet — a plain folder, not a git repo — and clones this bootstrap repo into ~/.env-config/env/, then re-execs `install.sh` from inside that clone.
 
 3. **Everything else runs like a normal on-disk run.** Core-package prompts, profile choice, cloning — no difference from running `./install.sh` directly on an already-cloned copy.
 
-4. **(Optional) override the bootstrap repo's own URL**, if it differs from what's baked into `install.sh`'s piped-execution branch:
+4. **(Optional) override the bootstrap repo's own clone URL**, e.g. if you forked this repo and the raw URL above now points at your fork's install.sh but the clone step should still pull from your fork too, not mine:
 
    ```bash
-   curl -fsSL <raw-url>/install.sh | BOOTSTRAP_REPO_URL=<your-bootstrap-repo-url> bash
+   curl -fsSL <your-raw-url>/install.sh | BOOTSTRAP_REPO_URL=<your-fork-clone-url> bash
    ```
 
 Piping a script straight into `bash` means you're trusting whoever controls that URL — fine for your own repo, worth a second look before you do it with anyone else's.

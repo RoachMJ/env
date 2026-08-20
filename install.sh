@@ -43,7 +43,13 @@ set -euo pipefail
 # This matters: it's what keeps a plaintext repo.env (written later,
 # see below) from ever landing inside a git working tree by accident.
 if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]}" ]]; then
-  : "${BOOTSTRAP_REPO_URL:?Piped execution needs BOOTSTRAP_REPO_URL=<the bootstrap repo clone URL> — see README.md}"
+  # This repo is public and needs no auth to clone (see README.md's
+  # "how safe" writeup), so a real default lives here rather than
+  # forcing every piped run to set BOOTSTRAP_REPO_URL by hand — that
+  # used to hard-fail with "Piped execution needs BOOTSTRAP_REPO_URL=..."
+  # on the plain one-liner. Override it (e.g. running your own fork)
+  # with: curl -fsSL <raw-url>/install.sh | BOOTSTRAP_REPO_URL=<url> bash
+  BOOTSTRAP_REPO_URL="${BOOTSTRAP_REPO_URL:-https://github.com/RoachMJ/env.git}"
   ENVCFG_HOME="${ENVCFG_HOME:-$HOME/.env-config}"
   BOOTSTRAP_DIR="$ENVCFG_HOME/env"
 
