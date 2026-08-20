@@ -355,6 +355,24 @@ install_pkgs() {
   esac
 }
 
+# _brew_managed <bin> — true if the binary currently resolved on
+# $PATH for <bin> actually lives under Homebrew's own prefix, i.e.
+# Homebrew installed/owns the copy that's active right now. False for
+# anything on macOS that isn't from brew: Xcode Command Line Tools'
+# git, a manually built binary, another package manager (MacPorts,
+# asdf, mise, ...), a tool's own official installer script, etc.
+# Only meaningful on Darwin — the Linux upgrade path never touches
+# brew, so nothing calls this there.
+_brew_managed() {
+  local bin="$1" resolved brew_prefix
+  command -v brew >/dev/null 2>&1 || return 1
+  resolved="$(command -v "$bin" 2>/dev/null)"
+  [[ -n "$resolved" ]] || return 1
+  brew_prefix="$(brew --prefix 2>/dev/null)"
+  [[ -n "$brew_prefix" ]] || return 1
+  [[ "$resolved" == "$brew_prefix"/* ]]
+}
+
 # offer_core_package <label> <bin> <mac-pkg> <apt-pkg> <dnf-pkg>
 #
 # Interactive, optional install-or-upgrade for one core tool. Never
@@ -366,6 +384,12 @@ install_pkgs() {
 #                         assumes exist, but always skippable)
 # No TTY on stdin means no prompt is possible, so this reports what it
 # would have asked and does nothing — it never assumes an answer.
+# On macOS specifically: if the binary already on $PATH isn't actually
+# a Homebrew-managed copy (see _brew_managed above), the upgrade offer
+# is skipped entirely rather than asked — `brew upgrade` on a package
+# name that isn't what's providing the active binary either errors out
+# or installs a second, unrelated copy that doesn't change what's
+# actually on $PATH. Leave it managed however it already is.
 # <apt-pkg>/<dnf-pkg> can be "" for a tool with no reliable apt/dnf
 # package (see starship's call site) — install/upgrade falls back to
 # that tool's own official installer script on Linux in that case.
@@ -375,6 +399,10 @@ offer_core_package() {
 
   if command -v "$bin" >/dev/null 2>&1; then
     current="$("$bin" --version 2>&1 | head -n1)"
+    if [[ "$OS_KERNEL" == "Darwin" ]] && ! _brew_managed "$bin"; then
+      log "$label already installed ($current), but not via Homebrew — skipping the upgrade offer rather than risk touching an unrelated copy. Update it however you originally installed it."
+      return 0
+    fi
     if [[ ! -t 0 ]]; then
       log "$label already installed ($current) — no TTY, skipping upgrade prompt."
       return 0
