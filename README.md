@@ -74,19 +74,28 @@ A profile with nothing in the bundle (or a bundle that fails to decrypt — wron
 
 You'll generally provision both PIV slots below regardless of which path(s) you actually use — the SSH slot and the encryption slot are independent, and having both costs nothing extra.
 
-**The fast way: `./install.sh --encrypt`**
+<details>
+<summary>The fast way: <code>./install.sh --encrypt</code></summary>
 
 A one-time interactive wizard that does everything below for you: checks which of `ykman`/`age`/`age-plugin-yubikey` are already installed and only installs what's actually missing, checks whether PIV slot 9a and a retired encryption slot are already occupied (and leaves them alone if so), asks for the SSH key's algorithm/PIN-policy/touch-policy/subject/certificate-expiration when provisioning slot 9a, asks for your env-personal/env-professional repo URLs and tokens, and writes the encrypted piv/repo.env.age plus the recipient into piv/recipient — a short, plain-text file `install.sh` reads at runtime; the script's own source is never edited. Generated key material (the SSH pubkey + a backup of its public certificate, the age identity, the recipient) lands in ~/.ssh/.env-config/, separate from the git-tracked repos.
 
 Re-running `--encrypt` after a failed or partial attempt is safe: both slot-provisioning steps check first and leave an already-occupied slot alone rather than re-generating into it, so nothing gets silently recreated or duplicated. The repo-URL/token prompts at the end do get re-asked every run though — nothing about those is saved between runs, so have them ready to retype if you're resuming after a failure partway through.
 
-**A note on "backing up" these keys:** both the SSH key (slot 9a) and the encryption key (the retired slot) are generated *on* the YubiKey's own chip and never leave it, in any form — that's what makes them hardware-backed. There's no private key file anywhere to copy or back up; the wizard's env-config-cert.pem (SSH) and age-identity.txt (encryption) are references to the YubiKey+slot, not key material, and are useless without the physical device.
+Treat it as a starting point, not gospel — `age-plugin-yubikey`'s exact flags have shifted across releases, and none of this has been run against physical YubiKey hardware in the environment it was written in. If a step fails, the manual walkthrough below is the same thing broken into individual commands you can run and inspect one at a time.
+
+</details>
+
+<details>
+<summary>A note on "backing up" these keys</summary>
+
+Both the SSH key (slot 9a) and the encryption key (the retired slot) are generated *on* the YubiKey's own chip and never leave it, in any form — that's what makes them hardware-backed. There's no private key file anywhere to copy or back up; the wizard's env-config-cert.pem (SSH) and age-identity.txt (encryption) are references to the YubiKey+slot, not key material, and are useless without the physical device.
 
 For the SSH key specifically, if you're locking a server down to key-only login (no password fallback), losing your only YubiKey means losing access — plan for that with **redundancy, not backup**: buy a second physical YubiKey, run the SSH part of `--encrypt` (or the manual walkthrough below) again with it inserted, and register both resulting public keys on every server you need access to. Losing one YubiKey then just means removing that one key from each server's authorized_keys, not being locked out. The encryption key (for repo.env) doesn't need this — losing it just means re-provisioning and re-encrypting a new repo.env, no standing access depends on it staying available.
 
-Treat it as a starting point, not gospel — `age-plugin-yubikey`'s exact flags have shifted across releases, and none of this has been run against physical YubiKey hardware in the environment it was written in. If a step fails, the manual walkthrough below is the same thing broken into individual commands you can run and inspect one at a time.
+</details>
 
-**One-time YubiKey provisioning by hand (both slots)**
+<details>
+<summary>One-time YubiKey provisioning by hand (both slots)</summary>
 
 - **Slot 9a (PIV Authentication)** — for the SSH auth path. If this slot already has a key on the YubiKey you're using, decide first: reuse it (skip straight to the export step below) or overwrite it. To overwrite, just run `ykman piv keys generate` again on 9a — it replaces whatever key was already there as part of generating the new one, no separate delete step needed (and note: `ykman piv keys delete`/`ykman piv certificates delete` are a *different*, newer pair of subcommands that need YubiKey firmware 5.7.0+; you don't need them here, so don't reach for them if you're on older firmware). The old key stops working everywhere it was registered the moment you overwrite it, so don't do that on a whim.
 
@@ -134,7 +143,10 @@ Treat it as a starting point, not gospel — `age-plugin-yubikey`'s exact flags 
 
   List what's already provisioned (configured for age) on a key with `age-plugin-yubikey --list`.
 
-**Building the encrypted bundle by hand**
+</details>
+
+<details>
+<summary>Building the encrypted bundle by hand</summary>
 
 1. Build the plaintext file. Only the fields you actually want to use need filling in — SSH-only or token-only per profile is fine, so is a mix:
 
@@ -170,6 +182,8 @@ Treat it as a starting point, not gospel — `age-plugin-yubikey`'s exact flags 
    ```
 
 5. From here on, `install.sh` decrypts piv/repo.env.age automatically at clone time (PIN + touch happen right there, on the YubiKey), writes the plaintext to ~/.env-config/repo.env, and asks you interactively which auth path to use for any profile where more than one is available.
+
+</details>
 
 </details>
 
