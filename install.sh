@@ -313,22 +313,31 @@ else
   AGE_IDENTITY="$SCRIPT_DIR/piv/age-identity.txt"
 fi
 
-# Optional encrypted bundle. Missing file / missing age or
-# age-plugin-yubikey / failed decrypt (wrong YubiKey, no touch, no
-# PIN) -> silent no-op, every profile just uses the plaintext
-# ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL above instead.
+# Optional encrypted bundle. Missing file -> silent no-op, every
+# profile just uses the plaintext ENV_PERSONAL_REPO_URL/
+# ENV_PROFESSIONAL_REPO_URL above instead. If the bundle DOES exist but
+# age/age-plugin-yubikey aren't installed yet, that's worth an offer to
+# install them (ensure_age_decrypt_tools, lib/common.sh) rather than
+# silently skipping straight to the placeholder default and leaving you
+# to puzzle out a confusing "no usable entry" error further down with
+# no clue why the bundle was never even tried.
 REPO_ENV_FILE="$ENVCFG_HOME/repo.env"
 HAVE_REPO_ENV=0
-if [[ -f "$AGE_BUNDLE" && -f "$AGE_IDENTITY" ]] &&
-  command -v age >/dev/null 2>&1 && command -v age-plugin-yubikey >/dev/null 2>&1; then
-  if age --decrypt -i "$AGE_IDENTITY" -o "$REPO_ENV_FILE" "$AGE_BUNDLE" 2>/dev/null; then
-    chmod 600 "$REPO_ENV_FILE"
-    # shellcheck source=/dev/null
-    source "$REPO_ENV_FILE"
-    HAVE_REPO_ENV=1
-    log "Decrypted piv/repo.env.age -> $REPO_ENV_FILE"
+if [[ -f "$AGE_BUNDLE" && -f "$AGE_IDENTITY" ]]; then
+  ensure_age_decrypt_tools
+
+  if command -v age >/dev/null 2>&1 && command -v age-plugin-yubikey >/dev/null 2>&1; then
+    if age --decrypt -i "$AGE_IDENTITY" -o "$REPO_ENV_FILE" "$AGE_BUNDLE" 2>/dev/null; then
+      chmod 600 "$REPO_ENV_FILE"
+      # shellcheck source=/dev/null
+      source "$REPO_ENV_FILE"
+      HAVE_REPO_ENV=1
+      log "Decrypted piv/repo.env.age -> $REPO_ENV_FILE"
+    else
+      warn "piv/repo.env.age exists but couldn't be decrypted (YubiKey present? touch confirmed?) — falling back to plaintext ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL for every profile."
+    fi
   else
-    warn "piv/repo.env.age exists but couldn't be decrypted (YubiKey present? touch confirmed?) — falling back to plaintext ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL for every profile."
+    warn "age/age-plugin-yubikey still not available — can't decrypt piv/repo.env.age this run. Falling back to plaintext ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL for every profile."
   fi
 fi
 

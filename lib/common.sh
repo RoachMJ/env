@@ -527,6 +527,67 @@ _upgrade_core_package() {
   esac
 }
 
+# ensure_age_decrypt_tools — called from install.sh right before it
+# tries to decrypt piv/repo.env.age, ONLY when that file (and the
+# identity file next to it) actually exist — i.e. there's a real
+# reason to want age/age-plugin-yubikey on this machine. Previously
+# install.sh just checked `command -v age` and, if missing, silently
+# skipped straight to the plaintext ENV_PERSONAL_REPO_URL/
+# ENV_PROFESSIONAL_REPO_URL fallback with no explanation — so a fresh
+# machine with the bundle already cloned (committed to the repo) but
+# neither tool installed yet would fall through to the placeholder
+# default and fail with a confusing "no usable entry" error, never
+# having been offered the one thing that would have fixed it.
+#
+# Same ask-first convention as offer_core_package above: prompts if
+# there's a TTY, warns and leaves it alone (never force-installs,
+# never hard-exits) if there isn't — failing to decrypt just means
+# install.sh falls back to the plaintext repo URLs, not fatal here the
+# way it is inside the --encrypt wizard (see encrypt_wizard.sh's own
+# _encrypt_check_age_tools, a separate, stricter copy of this same
+# idea for that explicit-setup context).
+ensure_age_decrypt_tools() {
+  local need_age=1 need_plugin=1
+  command -v age >/dev/null 2>&1 && need_age=0
+  command -v age-plugin-yubikey >/dev/null 2>&1 && need_plugin=0
+  [[ "$need_age" == "0" && "$need_plugin" == "0" ]] && return 0
+
+  local missing=()
+  [[ "$need_age" == "1" ]] && missing+=(age)
+  [[ "$need_plugin" == "1" ]] && missing+=(age-plugin-yubikey)
+
+  if [[ ! -t 0 ]]; then
+    warn "piv/repo.env.age is present but ${missing[*]} not installed, and no"
+    warn "TTY to ask — skipping install. Falling back to plaintext repo URLs"
+    warn "this run; install manually or re-run interactively to use the bundle."
+    return 0
+  fi
+
+  local reply
+  read -r -p "piv/repo.env.age is present but ${missing[*]} not installed. Install now to decrypt it? [Y/n] " reply
+  case "$reply" in
+    n | N)
+      warn "Skipping — falling back to plaintext repo URLs."
+      return 0
+      ;;
+  esac
+
+  local mac_missing=() apt_missing=()
+  [[ "$need_age" == "1" ]] && mac_missing+=(age) && apt_missing+=(age)
+  [[ "$need_plugin" == "1" ]] && mac_missing+=(age-plugin-yubikey)
+  # apt has no age-plugin-yubikey package as of this writing — Linux
+  # falls through to the manual cargo/GitHub-release note below.
+
+  install_pkgs "${mac_missing[*]}" "${apt_missing[*]}" ""
+
+  if ! command -v age-plugin-yubikey >/dev/null 2>&1; then
+    warn "age-plugin-yubikey still not found after install — install manually:"
+    warn "  cargo install age-plugin-yubikey   (needs Rust/cargo)"
+    warn "  or grab a release from https://github.com/str4d/age-plugin-yubikey/releases"
+    warn "Falling back to plaintext repo URLs this run."
+  fi
+}
+
 # ------------------------------------------------------------------
 # Uninstall-side: reading the manifest back out, and removing packages
 # it says THIS run (or an earlier one on this machine) installed.
