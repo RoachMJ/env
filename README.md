@@ -29,7 +29,7 @@ No `git clone` by hand needed — `install.sh` detects piped execution and clone
 1. **Run the one-liner.**
 
    ```bash
-   curl -fsSL <raw-url-to-this-file>/install.sh | bash
+   curl -fsSL https://github.com/RoachMJ/env/install.sh | bash
    ```
 
    (e.g. `https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/env-config-bootstrap/main/install.sh` once you've pushed this repo — swap in your real path. Note there's no `/env/` in the URL — this repo's own root is `install.sh`, lib/, etc. directly, the same way env-personal/ and env-professional/ are each just their own repo's root.)
