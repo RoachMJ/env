@@ -158,7 +158,13 @@ _encrypt_ssh_slot() {
         (
           cd "$ENCRYPTION_FILES_DIR" &&
             ykman piv certificates export 9a env-config-cert.pem &&
-            ssh-keygen -f env-config-cert.pem -i -m PKCS8 >env-config.pub
+            # env-config-cert.pem is an X.509 CERTIFICATE — ssh-keygen's
+            # `-m PKCS8` import can't read one directly ("not a
+            # recognised public key format"). Pull just the
+            # SubjectPublicKeyInfo block out with openssl first.
+            openssl x509 -in env-config-cert.pem -pubkey -noout >env-config-pubkey.pkcs8.tmp &&
+            ssh-keygen -f env-config-pubkey.pkcs8.tmp -i -m PKCS8 >env-config.pub &&
+            rm -f env-config-pubkey.pkcs8.tmp
         ) || warn "Couldn't re-export the existing key — see output above."
         log "Public key (re-exported from the existing slot 9a key) written"
         log "to $ENCRYPTION_FILES_DIR/env-config.pub"
@@ -298,8 +304,10 @@ _encrypt_ssh_slot() {
   log "(see README.md)."
   log "Also saved $ENCRYPTION_FILES_DIR/env-config-cert.pem — a backup of the"
   log "PUBLIC certificate only, letting you re-export env-config.pub later"
-  log "(ssh-keygen -f env-config-cert.pem -i -m PKCS8) without needing the"
-  log "physical YubiKey present. There's no equivalent for the private key,"
+  log "(openssl x509 -in env-config-cert.pem -pubkey -noout | ssh-keygen -f"
+  log "/dev/stdin -i -m PKCS8) without needing the physical YubiKey present"
+  log "— install.sh's regenerate_yubikey_ssh_pubkeys does exactly this"
+  log "automatically. There's no equivalent for the private key,"
   log "on purpose: it's generated on the YubiKey's own chip and never"
   log "leaves it, in any form — that's what \"hardware-backed\" means here."
 

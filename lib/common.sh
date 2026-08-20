@@ -647,20 +647,28 @@ _next_numbered_dest() {
 # bootstrap repo's own piv/ folder — one per physical YubiKey
 # provisioned via ./install.sh --encrypt; numbered when there's more
 # than one, e.g. a backup login key, see _next_numbered_dest() above),
-# regenerates the matching env-config*.pub into ~/.ssh/.env-config/ via
-# `ssh-keygen -f <cert> -i -m PKCS8`. Runs on every install, not just
-# --encrypt, so a fresh machine with only a git clone and the physical
-# YubiKey(s) in hand ends up with the same pubkey(s) as the machine
-# that originally ran the wizard — nothing here touches the private
-# key, the cert is public data by design (see README.md). Silently
-# does nothing if piv/ has no certs yet, or ssh-keygen isn't installed.
+# regenerates the matching env-config*.pub into ~/.ssh/.env-config/.
+# Runs on every install, not just --encrypt, so a fresh machine with
+# only a git clone and the physical YubiKey(s) in hand ends up with
+# the same pubkey(s) as the machine that originally ran the wizard —
+# nothing here touches the private key, the cert is public data by
+# design (see README.md). Silently does nothing if piv/ has no certs
+# yet, or ssh-keygen/openssl isn't installed.
+#
+# env-config-cert.pem is an X.509 CERTIFICATE (ykman piv certificates
+# export), not a bare PKCS8 public key — ssh-keygen's `-m PKCS8` import
+# mode can't read a certificate directly (fails with "not a recognised
+# public key format"). `openssl x509 -pubkey -noout` pulls just the
+# SubjectPublicKeyInfo block back out first, which ssh-keygen *can*
+# read — confirmed against a real self-signed EC cert, not assumed.
 regenerate_yubikey_ssh_pubkeys() {
   local piv_dir="$1"
   local piv_ssh_dir="$HOME/.ssh/.env-config"
   command -v ssh-keygen >/dev/null 2>&1 || return 0
+  command -v openssl >/dev/null 2>&1 || return 0
   [[ -d "$piv_dir" ]] || return 0
 
-  local cert base pub_name pub_path found=0
+  local cert base pub_name pub_path pkcs8_tmp found=0
   for cert in "$piv_dir"/env-config-cert*.pem; do
     [[ -f "$cert" ]] || continue
     found=1
@@ -670,12 +678,15 @@ regenerate_yubikey_ssh_pubkeys() {
     mkdir -p "$piv_ssh_dir"
     chmod 700 "$piv_ssh_dir"
     pub_path="$piv_ssh_dir/$pub_name"
-    if ssh-keygen -f "$cert" -i -m PKCS8 >"$pub_path.tmp" 2>/dev/null; then
+    pkcs8_tmp="$pub_path.pkcs8.tmp"
+    if openssl x509 -in "$cert" -pubkey -noout >"$pkcs8_tmp" 2>/dev/null &&
+      ssh-keygen -f "$pkcs8_tmp" -i -m PKCS8 >"$pub_path.tmp" 2>/dev/null; then
       mv "$pub_path.tmp" "$pub_path"
       chmod 644 "$pub_path"
+      rm -f "$pkcs8_tmp"
       log "Regenerated $pub_path from $(basename "$cert")"
     else
-      rm -f "$pub_path.tmp"
+      rm -f "$pub_path.tmp" "$pkcs8_tmp"
       warn "Couldn't regenerate a pubkey from $cert — skipping it."
     fi
   done
@@ -684,6 +695,19 @@ regenerate_yubikey_ssh_pubkeys() {
     log "regenerate (run './install.sh --encrypt' first if you want"
     log "YubiKey-backed SSH)."
   fi
+  # Explicit — without this, the function's return status is whatever
+  # the *last executed command* left behind, which is this if-with-no-
+  # else: when $found is "1" (the common case — a cert WAS there,
+  # regardless of whether ssh-keygen/openssl above actually succeeded
+  # for it), the condition test itself evaluates false, and bash's `if`
+  # with no matching branch returns THAT false status as the whole
+  # statement's exit code. Called as a bare statement under `set -euo
+  # pipefail` (every caller here), a non-zero return killed the entire
+  # install — independent of whether pubkey regeneration actually
+  # succeeded. This is what was actually causing the script to exit
+  # right after "Couldn't regenerate a pubkey...", not the warning
+  # itself, which is handled and non-fatal on its own.
+  return 0
 }
 
 # wire_yubikey_ssh_config <alias:realhost> [alias:realhost...]
