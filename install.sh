@@ -62,7 +62,25 @@ if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]}" ]]; then
     git clone --depth 1 "$BOOTSTRAP_REPO_URL" "$BOOTSTRAP_DIR"
   fi
 
-  exec bash "$BOOTSTRAP_DIR/install.sh" "$@"
+  # Reconnect stdin to the controlling terminal before re-exec'ing.
+  # Piped execution (curl ... | bash) leaves stdin as the now-exhausted
+  # pipe, so without this, every `[[ -t 0 ]]` check for the REST of
+  # this install (profile choice below, git identity, SSH-vs-token
+  # auth choice, etc. — all the way through whichever profile
+  # install.sh hands off to) would see "no TTY" even though you're
+  # sitting at a normal interactive shell, and either silently skip or
+  # hard-exit. /dev/tty is the actual controlling terminal, independent
+  # of whatever stdin is currently wired to (the curl pipe, in this
+  # case) — reattach it if one exists. If it doesn't (genuinely
+  # non-interactive: CI, cron, another script piping this one in),
+  # leave stdin alone so the existing "No TTY" checks further down
+  # keep working as designed instead of hanging on a device that isn't
+  # there.
+  if [[ -r /dev/tty ]]; then
+    exec bash "$BOOTSTRAP_DIR/install.sh" "$@" < /dev/tty
+  else
+    exec bash "$BOOTSTRAP_DIR/install.sh" "$@"
+  fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
