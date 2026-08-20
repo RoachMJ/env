@@ -444,28 +444,23 @@ _encrypt_build_bundle() {
   fi
 
   echo
-  echo "Now the repo URLs (and optional tokens) to encrypt. Leave a field"
-  echo "blank to skip it — you don't need every field filled in, and this is"
-  echo "only ever readable with the physical YubiKey that generated the"
-  echo "recipient above."
+  echo "Now the repo SSH URLs to encrypt. Leave a field blank to skip it —"
+  echo "you don't need both filled in, and this is only ever readable with"
+  echo "the physical YubiKey that generated the recipient above."
   echo
 
-  local personal_ssh personal_https personal_token=""
-  local professional_ssh professional_https professional_token=""
+  local personal_ssh professional_ssh repo_access_token
 
   read -r -p "env-personal repo — SSH URL (git@..., or blank): " personal_ssh
-  read -r -p "env-personal repo — HTTPS URL (for token auth, or blank): " personal_https
-  if [[ -n "$personal_https" ]]; then
-    read -r -s -p "env-personal repo — access token: " personal_token
-    echo
-  fi
-
   read -r -p "env-professional repo — SSH URL (git@..., or blank): " professional_ssh
-  read -r -p "env-professional repo — HTTPS URL (for token auth, or blank): " professional_https
-  if [[ -n "$professional_https" ]]; then
-    read -r -s -p "env-professional repo — access token: " professional_token
-    echo
-  fi
+
+  echo
+  echo "Optional: a single repo-access token, shared by both profiles,"
+  echo "used instead of SSH (over HTTPS) if set. Leave blank to stick with"
+  echo "plain SSH — that's the normal case if ssh-agent already has your"
+  echo "key loaded."
+  read -r -s -p "Repo access token (or blank): " repo_access_token
+  echo
 
   local plain
   plain="$(mktemp)"
@@ -473,12 +468,9 @@ _encrypt_build_bundle() {
     echo "# repo.env — decrypted at clone time by install.sh and sourced"
     echo "# directly into its environment. Only piv/repo.env.age (the"
     echo "# encrypted form of this file) is ever committed — never this."
-    [[ -n "$personal_ssh" ]] && echo "ENV_PERSONAL_SSH_URL=$personal_ssh"
-    [[ -n "$personal_https" ]] && echo "ENV_PERSONAL_HTTPS_URL=$personal_https"
-    [[ -n "$personal_token" ]] && echo "ENV_PERSONAL_TOKEN=$personal_token"
-    [[ -n "$professional_ssh" ]] && echo "ENV_PROFESSIONAL_SSH_URL=$professional_ssh"
-    [[ -n "$professional_https" ]] && echo "ENV_PROFESSIONAL_HTTPS_URL=$professional_https"
-    [[ -n "$professional_token" ]] && echo "ENV_PROFESSIONAL_TOKEN=$professional_token"
+    [[ -n "$personal_ssh" ]] && echo "PERSONAL_SSH_URL=$personal_ssh"
+    [[ -n "$professional_ssh" ]] && echo "PROFESSIONAL_SSH_URL=$professional_ssh"
+    [[ -n "$repo_access_token" ]] && echo "REPO_ACCESS_TOKEN=$repo_access_token"
   } >"$plain"
 
   mkdir -p "$SCRIPT_DIR/piv"

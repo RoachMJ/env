@@ -61,23 +61,25 @@ No TTY on stdin (e.g. a non-interactive CI-style run) means no prompt is possibl
 </details>
 
 <details>
-<summary><strong>Repo access: two paths, one encrypted bundle</strong></summary>
+<summary><strong>Repo access: SSH key + age encryption</strong></summary>
 
-Two independent ways to give a brand-new machine access to a private profile repo. Neither requires anything memorized, written down, or stored anywhere outside a single physical YubiKey.
+Giving a brand-new machine access to a private profile repo needs a URL and, usually, nothing else — auth is SSH by default, handled entirely by whatever's already loaded in `ssh-agent`. Nothing to memorize, write down, or store anywhere outside a single physical YubiKey.
 
-- **Path 1 — SSH, hardware-backed.** A git@ SSH URL; auth comes from whatever's already loaded in `ssh-agent`. No secret in this repo either way — even the encrypted bundle below only ever holds a *plaintext-looking* SSH URL, never key material.
-- **Path 2 — a token over HTTPS.** An HTTPS URL plus a personal access token, used as a Basic-auth header at clone time — never embedded in the URL, never written to either profile's git config.
+Two places a profile's SSH URL can come from, checked in this order:
 
-Both live, per profile, in one encrypted file: piv/repo.env.age. It's encrypted to an ECC P-256 key that lives only on your YubiKey (a PIV retired slot, provisioned via `age-plugin-yubikey`) — decrypting it needs the physical key, its PIN, and (depending on touch policy) a touch. `install.sh` decrypts it once per run to ~/.env-config/repo.env, then, for any profile where more than one auth method is available, **asks you interactively which one to use** — it no longer guesses or silently prefers one over the other.
+1. **The encrypted bundle** — piv/repo.env.age, holding `PERSONAL_SSH_URL`/`PROFESSIONAL_SSH_URL`. It's encrypted to an ECC P-256 key that lives only on your YubiKey (a PIV retired slot, provisioned via `age-plugin-yubikey`) — decrypting it needs the physical key, its PIN, and (depending on touch policy) a touch. `install.sh` decrypts it once per run to ~/.env-config/repo.env and sources it. If a value is present there for a profile, it wins.
+2. **The plaintext default** — `ENV_PERSONAL_REPO_URL`/`ENV_PROFESSIONAL_REPO_URL` near the top of `install.sh`, used for any profile the bundle doesn't cover (bundle missing, decrypt failed, or just no entry for that profile).
 
-A profile with nothing in the bundle (or a bundle that fails to decrypt — wrong YubiKey, no touch, no PIN) just falls back to that profile's plaintext ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL near the top of `install.sh`.
+Neither source is actually secret on its own — it's a plain `git@...` URL either way, same as one you'd type by hand. The encryption exists so a fresh machine doesn't need your real URLs typed in manually, not to hide them.
 
-You'll generally provision both PIV slots below regardless of which path(s) you actually use — the SSH slot and the encryption slot are independent, and having both costs nothing extra.
+**Optional: a shared repo-access token.** The bundle can also carry `REPO_ACCESS_TOKEN` — one token, not per-profile. If it's set, it wins over SSH for *both* profiles: `install.sh` rewrites whichever URL it resolved (bundle or plaintext) from `git@host:path` to `https://host/path` and sends the token as a host-scoped Basic-auth header at clone time — never embedded in the URL, never written to either profile's git config. No token in the bundle means no behavior change: plain SSH, as above. This is the one piece of the bundle that's actually secret, which is exactly why it only ever exists encrypted, never in `install.sh` itself.
+
+You'll still provision both PIV slots below — the SSH slot and the encryption slot are independent and separate concerns (one is *the* key you SSH with, the other only protects the repo.env bundle).
 
 <details>
 <summary>The fast way: <code>./install.sh --encrypt</code></summary>
 
-A one-time interactive wizard that does everything below for you: checks which of `ykman`/`age`/`age-plugin-yubikey` are already installed and only installs what's actually missing, checks whether PIV slot 9a and a retired encryption slot are already occupied (and leaves them alone if so), asks for the SSH key's algorithm/PIN-policy/touch-policy/subject/certificate-expiration when provisioning slot 9a, asks for your env-personal/env-professional repo URLs and tokens, and writes the encrypted piv/repo.env.age plus the recipient into piv/recipient — a short, plain-text file `install.sh` reads at runtime; the script's own source is never edited. Generated key material (the SSH pubkey + a backup of its public certificate, the age identity, the recipient) lands in ~/.ssh/.env-config/, separate from the git-tracked repos.
+A one-time interactive wizard that does everything below for you: checks which of `ykman`/`age`/`age-plugin-yubikey` are already installed and only installs what's actually missing, checks whether PIV slot 9a and a retired encryption slot are already occupied (and leaves them alone if so), asks for the SSH key's algorithm/PIN-policy/touch-policy/subject/certificate-expiration when provisioning slot 9a, asks for your env-personal/env-professional repo SSH URLs plus an optional shared `REPO_ACCESS_TOKEN`, and writes the encrypted piv/repo.env.age plus the recipient into piv/recipient — a short, plain-text file `install.sh` reads at runtime; the script's own source is never edited. Generated key material (the SSH pubkey + a backup of its public certificate, the age identity, the recipient) lands in ~/.ssh/.env-config/, separate from the git-tracked repos.
 
 Re-running `--encrypt` after a failed or partial attempt is safe: both slot-provisioning steps check first and leave an already-occupied slot alone rather than re-generating into it, so nothing gets silently recreated or duplicated. The repo-URL/token prompts at the end do get re-asked every run though — nothing about those is saved between runs, so have them ready to retype if you're resuming after a failure partway through.
 
@@ -148,17 +150,17 @@ For the SSH key specifically, if you're locking a server down to key-only login 
 <details>
 <summary>Building the encrypted bundle by hand</summary>
 
-1. Build the plaintext file. Only the fields you actually want to use need filling in — SSH-only or token-only per profile is fine, so is a mix:
+1. Build the plaintext file. Only the fields you actually want to use need filling in — one profile, or both, plus an optional shared token:
 
    ```bash
    cat > /tmp/repo.env.plain << 'EOF'
-   ENV_PERSONAL_SSH_URL=git@github.com:YOUR_GITHUB_USERNAME/env-personal.git
-   ENV_PROFESSIONAL_HTTPS_URL=https://gitlab.example.com/group/env-professional.git
-   ENV_PROFESSIONAL_TOKEN=glpat-...
+   PERSONAL_SSH_URL=git@github.com:YOUR_GITHUB_USERNAME/env-personal.git
+   PROFESSIONAL_SSH_URL=git@gitlab.example.com:group/env-professional.git
+   REPO_ACCESS_TOKEN=glpat-...
    EOF
    ```
 
-   This is a plain shell env file, not YAML — `install.sh` sources it directly into its own environment after decrypting it, no parser involved.
+   This is a plain shell env file, not YAML — `install.sh` sources it directly into its own environment after decrypting it, no parser involved. Variable names drop the "env-" from the profile name: `env-personal` -> `PERSONAL_SSH_URL`, `env-professional` -> `PROFESSIONAL_SSH_URL` (see `clone_or_pull_profile` in `install.sh`). `REPO_ACCESS_TOKEN` is a single value shared by both profiles, not per-profile — leave it out entirely to stick with plain SSH.
 
 2. Encrypt it to the YubiKey recipient from the provisioning step above:
 
@@ -181,7 +183,7 @@ For the SSH key specifically, if you're locking a server down to key-only login 
    git add env/piv/repo.env.age env/piv/recipient
    ```
 
-5. From here on, `install.sh` decrypts piv/repo.env.age automatically at clone time (PIN + touch happen right there, on the YubiKey), writes the plaintext to ~/.env-config/repo.env, and asks you interactively which auth path to use for any profile where more than one is available.
+5. From here on, `install.sh` decrypts piv/repo.env.age automatically at clone time (PIN + touch happen right there, on the YubiKey), writes the plaintext to ~/.env-config/repo.env, and uses whichever SSH URL it finds there for each profile — falling back to that profile's plaintext default in `install.sh` if the bundle has nothing for it — unless `REPO_ACCESS_TOKEN` is also set, in which case it clones both profiles over HTTPS with that token instead.
 
 </details>
 

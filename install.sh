@@ -265,25 +265,31 @@ case "$profile_choice" in
 esac
 
 # 3. Shallow-clone (or pull) each chosen profile's repo — separate
-#    repos, not folders in this one. Two independent access patterns,
-#    picked interactively per profile when more than one applies (see
-#    README.md "Repo access: two paths"):
+#    repos, not folders in this one. Two places a profile's URL can
+#    come from, checked in this order (see README.md "Repo access"):
 #
-#    - Path 1 (SSH): ENV_PERSONAL_REPO_URL / ENV_PROFESSIONAL_REPO_URL
-#      below (or *_SSH_URL from the decrypted bundle) is a git@ URL,
-#      auth comes from whatever's already in ssh-agent (e.g. a YubiKey
-#      PIV key via `ssh-add -s`). No secret in this repo either way.
-#    - Path 2 (token): *_HTTPS_URL / *_TOKEN from the decrypted bundle.
-#      Clones over HTTPS using the token as a Basic-auth header — never
-#      in the URL, never written to env-personal/.git or
-#      env-professional/.git config.
+#    1. *_SSH_URL from piv/repo.env.age, decrypted below — wins if
+#       present, since a real URL there means you deliberately set one.
+#    2. ENV_PERSONAL_REPO_URL / ENV_PROFESSIONAL_REPO_URL right below —
+#       the plaintext fallback, used untouched if the bundle has
+#       nothing for that profile (missing, decrypt failed, or just no
+#       entry for it).
 #
-#    piv/repo.env.age holds both, encrypted to a YubiKey-resident ECC
-#    P-256 key (age-plugin-yubikey). It decrypts once per run to
+#    Whichever URL wins, auth is SSH (ssh-agent, e.g. a YubiKey PIV key
+#    via `ssh-add -s`) UNLESS the decrypted bundle also carries a
+#    REPO_ACCESS_TOKEN — a single token, not per-profile — in which
+#    case that token wins for BOTH profiles: the resolved URL is
+#    converted from git@host:path to https://host/path and the token
+#    is sent as a Basic-auth header, scoped to that host only, never
+#    written to either profile's git config. No token in the bundle ->
+#    plain SSH, no behavior change.
+#
+#    piv/repo.env.age is encrypted to a YubiKey-resident ECC P-256 key
+#    (age-plugin-yubikey). It decrypts once per run to
 #    $ENVCFG_HOME/repo.env (chmod 600, never committed), which is then
 #    sourced directly into this script's environment.
 ENV_PERSONAL_REPO_URL="${ENV_PERSONAL_REPO_URL:-git@github.com:YOUR_GITHUB_USERNAME/env-personal.git}"
-ENV_PROFESSIONAL_REPO_URL="${ENV_PROFESSIONAL_REPO_URL:-https://REPLACE_ME.example.com/REPLACE_ME_GROUP/env-professional.git}"
+ENV_PROFESSIONAL_REPO_URL="${ENV_PROFESSIONAL_REPO_URL:-git@REPLACE_ME.example.com:REPLACE_ME_GROUP/env-professional.git}"
 
 # The recipient piv/repo.env.age is encrypted to — an age-plugin-yubikey
 # identity backed by an ECC P-256 key in a YubiKey PIV retired slot.
@@ -307,11 +313,10 @@ else
   AGE_IDENTITY="$SCRIPT_DIR/piv/age-identity.txt"
 fi
 
-# Optional Path 2 bundle. Missing file / missing age or
+# Optional encrypted bundle. Missing file / missing age or
 # age-plugin-yubikey / failed decrypt (wrong YubiKey, no touch, no
-# PIN) -> silent no-op, every profile just uses Path 1 (or the
-# plaintext ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL above)
-# instead.
+# PIN) -> silent no-op, every profile just uses the plaintext
+# ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL above instead.
 REPO_ENV_FILE="$ENVCFG_HOME/repo.env"
 HAVE_REPO_ENV=0
 if [[ -f "$AGE_BUNDLE" && -f "$AGE_IDENTITY" ]] &&
@@ -336,92 +341,63 @@ fi
 # wire_yubikey_ssh_config().
 regenerate_yubikey_ssh_pubkeys "$SCRIPT_DIR/piv"
 
-# url_host <url> — bare host[:port], no scheme, no path.
-url_host() {
-  local rest="${1#*://}"
-  rest="${rest%%/*}"
-  printf '%s' "$rest"
-}
-
-# choose_auth_path <profile> — echoes "ssh", "token", or "" (nothing
-# usable from the decrypted bundle for this profile). Only prompts
-# when both are actually available; picks silently otherwise.
-choose_auth_path() {
-  local profile="$1" upper ssh_var https_var token_var ssh_val https_val token_val
-  # tr '-' '_' matters: profile is "env-personal"/"env-professional" —
-  # hyphens aren't legal in bash variable names, so ENV-PERSONAL_SSH_URL
-  # would never actually resolve via the ${!ssh_var} indirection below.
-  upper="$(printf '%s' "$profile" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
-  ssh_var="${upper}_SSH_URL"
-  https_var="${upper}_HTTPS_URL"
-  token_var="${upper}_TOKEN"
-  ssh_val="${!ssh_var:-}"
-  https_val="${!https_var:-}"
-  token_val="${!token_var:-}"
-
-  local have_ssh=0 have_token=0
-  [[ -n "$ssh_val" ]] && have_ssh=1
-  [[ -n "$https_val" && -n "$token_val" ]] && have_token=1
-
-  if [[ "$have_ssh" == "1" && "$have_token" == "1" ]]; then
-    echo >&2
-    echo "Two ways to clone '$profile' — which do you want?" >&2
-    echo "  1) SSH (Path 1) — $ssh_val" >&2
-    echo "  2) Token over HTTPS (Path 2) — $https_val" >&2
-    local reply
-    read -r -p "> " reply
-    case "$reply" in
-      2 | token) printf 'token\n' ;;
-      *) printf 'ssh\n' ;;
-    esac
-    return 0
-  elif [[ "$have_ssh" == "1" ]]; then
-    printf 'ssh\n'
-    return 0
-  elif [[ "$have_token" == "1" ]]; then
-    printf 'token\n'
-    return 0
+# ssh_to_https <ssh_url> — best-effort git@host:path -> https://host/path.
+# Only needed when REPO_ACCESS_TOKEN is set: a token attaches to an
+# HTTPS remote as a Basic-auth header, but every URL in this script
+# (bundle or plaintext default) is written in git@host:path SSH form.
+# Anything not matching that exact shape passes through unchanged.
+ssh_to_https() {
+  local url="$1"
+  if [[ "$url" =~ ^git@([^:]+):(.+)$ ]]; then
+    printf 'https://%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s\n' "$url"
   fi
-  printf '\n'
 }
 
+# clone_or_pull_profile <profile> — profile is "env-personal" or
+# "env-professional". The bundle's own variable names drop the "env-"
+# prefix (PERSONAL_SSH_URL / PROFESSIONAL_SSH_URL — see
+# encrypt_wizard.sh and README.md "Building the encrypted bundle by
+# hand"), so that's what gets checked via indirect expansion below.
+# Bundle value wins when present; otherwise falls back to the
+# plaintext ENV_PERSONAL_REPO_URL/ENV_PROFESSIONAL_REPO_URL default
+# above. If the bundle also set REPO_ACCESS_TOKEN (one token, shared
+# by both profiles — not per-profile), it wins over SSH entirely: the
+# resolved URL gets rewritten to https:// and the token rides along as
+# a host-scoped Basic-auth header. No token -> plain SSH, unchanged.
 clone_or_pull_profile() {
   local profile="$1" profile_dir="$ENVCFG_HOME/$1"
-  local repo_url="" auth_note="" chosen="" upper url_var
+  local repo_url="" short upper ssh_var url_var auth_note
   local -a token_args=()
 
-  if [[ "$HAVE_REPO_ENV" == "1" ]]; then
-    chosen="$(choose_auth_path "$profile")"
+  # "env-personal" -> "personal" -> "PERSONAL"; "env-professional" ->
+  # "professional" -> "PROFESSIONAL".
+  short="${profile#env-}"
+  upper="$(printf '%s' "$short" | tr '[:lower:]' '[:upper:]')"
+  ssh_var="${upper}_SSH_URL"
+
+  if [[ -n "${!ssh_var:-}" ]]; then
+    repo_url="${!ssh_var}"
+  elif [[ "$profile" == "env-personal" ]]; then
+    repo_url="$ENV_PERSONAL_REPO_URL"
+  else
+    repo_url="$ENV_PROFESSIONAL_REPO_URL"
   fi
 
-  upper="$(printf '%s' "$profile" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
-
-  if [[ "$chosen" == "ssh" ]]; then
-    local ssh_var="${upper}_SSH_URL"
-    repo_url="${!ssh_var}"
-    auth_note="SSH auth — your SSH agent/key handles this (Path 1)"
-  elif [[ "$chosen" == "token" ]]; then
-    local https_var="${upper}_HTTPS_URL" token_var="${upper}_TOKEN"
-    local host user token
-    repo_url="${!https_var}"
-    token="${!token_var}"
-    host="$(url_host "$repo_url")"
+  auth_note="SSH auth — your SSH agent/key handles this"
+  if [[ -n "${REPO_ACCESS_TOKEN:-}" ]]; then
+    local https_url host user
+    https_url="$(ssh_to_https "$repo_url")"
+    host="${https_url#https://}"
+    host="${host%%/*}"
     case "$host" in
       github.com) user="x-access-token" ;;
       *) user="oauth2" ;;
     esac
-    token_args=(-c "http.https://$host/.extraheader=Authorization: Basic $(printf '%s:%s' "$user" "$token" | base64 | tr -d '\n')")
-    auth_note="HTTPS auth — using the decrypted repo.env token (Path 2)"
-  else
-    if [[ "$profile" == "env-personal" ]]; then
-      repo_url="$ENV_PERSONAL_REPO_URL"
-    else
-      repo_url="$ENV_PROFESSIONAL_REPO_URL"
-    fi
-    case "$repo_url" in
-      git@*) auth_note="SSH auth — your SSH agent/key handles this (Path 1)" ;;
-      *) auth_note="HTTPS auth — you'll be prompted for a username/password once, then your credential manager caches it" ;;
-    esac
+    token_args=(-c "http.https://$host/.extraheader=Authorization: Basic $(printf '%s:%s' "$user" "$REPO_ACCESS_TOKEN" | base64 | tr -d '\n')")
+    repo_url="$https_url"
+    auth_note="HTTPS auth — using REPO_ACCESS_TOKEN from the decrypted bundle"
   fi
 
   if [[ -d "$profile_dir" && -d "$profile_dir/.git" ]]; then
@@ -450,7 +426,7 @@ clone_or_pull_profile() {
   log "  ($auth_note)"
   if ! git "${token_args[@]}" clone --depth 1 "$repo_url" "$profile_dir"; then
     echo "Clone of $repo_url into $profile_dir failed — check the URL and your" >&2
-    echo "auth (SSH key loaded / repo-access token valid) and try again." >&2
+    echo "auth (SSH key loaded / REPO_ACCESS_TOKEN valid) and try again." >&2
     exit 1
   fi
 }

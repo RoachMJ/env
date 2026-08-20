@@ -373,12 +373,64 @@ _brew_managed() {
   [[ "$resolved" == "$brew_prefix"/* ]]
 }
 
+# _core_package_update_available <mac-pkg> <apt-pkg> <dnf-pkg>
+#
+# True (0) if the package manager actually reports a newer version
+# available; false (1) if the installed one is already current. Used
+# so offer_core_package only asks "Upgrade to latest?" when there's
+# something to upgrade TO, instead of prompting every single run
+# whether or not the version has changed. Only ever called from inside
+# an `if` by offer_core_package below — its "false" branches are the
+# intended signal, not a bug, so it's safe for those to be its natural
+# return value.
+# Tools with no apt/dnf package (installed via their own official
+# installer script on Linux instead — see starship's call site) have
+# no package-manager-backed way to check without an extra network
+# call, so this reports "true" (ask anyway) for that case rather than
+# silently assuming up to date.
+_core_package_update_available() {
+  local mac_pkg="$1" apt_pkg="$2" dnf_pkg="$3"
+  case "$OS_KERNEL" in
+    Darwin)
+      command -v brew >/dev/null 2>&1 || return 0
+      local outdated=""
+      outdated="$(brew outdated --quiet "$mac_pkg" 2>/dev/null || true)"
+      [[ -n "$outdated" ]]
+      ;;
+    Linux)
+      if [[ -n "$apt_pkg" && "$PKG_MGR" == "apt" ]]; then
+        if [[ "$_APT_UPDATED" == "0" ]]; then
+          sudo apt-get update >/dev/null 2>&1 || true
+          _APT_UPDATED=1
+        fi
+        apt list --upgradable 2>/dev/null | grep -q "^${apt_pkg}/"
+      elif [[ -n "$dnf_pkg" && "$PKG_MGR" == "dnf" ]]; then
+        local rc=0
+        dnf check-update -q "$dnf_pkg" >/dev/null 2>&1 || rc=$?
+        # dnf check-update's own exit codes: 100 = updates available,
+        # 0 = none, 1 = error. Treat "error" as "can't tell", ask anyway.
+        [[ "$rc" == "100" ]]
+      else
+        return 0
+      fi
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 # offer_core_package <label> <bin> <mac-pkg> <apt-pkg> <dnf-pkg>
 #
 # Interactive, optional install-or-upgrade for one core tool. Never
 # acts silently: checks whether <bin> is already on $PATH first, and
 # only THEN decides what to ask —
-#   already present  -> "Upgrade to latest? [y/N]" (default: leave it)
+#   already present  -> "Upgrade to latest? [y/N]" (default: leave it),
+#                        but only asked at all if there's actually an
+#                        update available (see
+#                        _core_package_update_available above) — same
+#                        version installed means no prompt, nothing to
+#                        do
 #   missing           -> "Install it? [Y/n]" (default: install, since
 #                         these are things the rest of this repo
 #                         assumes exist, but always skippable)
@@ -403,8 +455,12 @@ offer_core_package() {
       log "$label already installed ($current), but not via Homebrew — skipping the upgrade offer rather than risk touching an unrelated copy. Update it however you originally installed it."
       return 0
     fi
+    if ! _core_package_update_available "$mac_pkg" "$apt_pkg" "$dnf_pkg"; then
+      log "$label already installed ($current) and up to date — nothing to upgrade."
+      return 0
+    fi
     if [[ ! -t 0 ]]; then
-      log "$label already installed ($current) — no TTY, skipping upgrade prompt."
+      log "$label already installed ($current), update available — no TTY, skipping upgrade prompt."
       return 0
     fi
     read -r -p "$label already installed ($current). Upgrade to latest? [y/N] " reply
