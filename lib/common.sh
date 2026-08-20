@@ -534,3 +534,271 @@ uninstall_item_packages() {
     uninstall_package "$mgr" "$name"
   done <<<"$rows"
 }
+
+# ------------------------------------------------------------------
+# YubiKey-backed SSH (PIV slot 9a) config wiring. Generic on purpose —
+# takes a list of hosts as arguments rather than deciding for itself
+# which hosts matter, since that's genuinely different per profile:
+# env-personal's own gitconfig forces GitHub over SSH (an `insteadOf`
+# rewrite), env-professional's deliberately doesn't (HTTPS+PAT is the
+# primary there — see that profile's gitconfig header comment), so it
+# asks interactively instead. See each profile's install.sh 'git' item
+# for exactly how each one decides what to pass in here — that
+# decision belongs there, not in this shared file.
+#
+# Needs the bootstrap repo's `./install.sh --encrypt` to have already
+# provisioned PIV slot 9a (env-config.pub present under
+# ~/.ssh/.env-config/) — silently does nothing otherwise, since this
+# is opt-in, not everyone uses YubiKey-backed SSH.
+# ------------------------------------------------------------------
+
+# _yubikey_pkcs11_path — echoes the discovered libykcs11 path (the
+# PKCS#11 module SSH needs to talk to the YubiKey's PIV applet), or
+# nothing if it can't find one. Installs yubico-piv-tool first if
+# missing — the bootstrap repo's --encrypt wizard never installs this
+# itself, only ykman/age/age-plugin-yubikey, since this piece is
+# SSH-specific and not needed for the repo-access encryption path.
+# Path is discovered via 'brew --prefix', not hardcoded, so this works
+# the same on Intel (/usr/local) and Apple Silicon (/opt/homebrew)
+# without caring which one you're on.
+_yubikey_pkcs11_path() {
+  local path=""
+  case "$OS_KERNEL" in
+    Darwin)
+      if ! brew list --formula yubico-piv-tool >/dev/null 2>&1; then
+        log "Installing yubico-piv-tool (provides libykcs11, the PKCS#11 module SSH needs for the YubiKey)"
+        HOMEBREW_NO_AUTO_UPDATE=1 brew install yubico-piv-tool || return 0
+      fi
+      local prefix
+      prefix="$(brew --prefix yubico-piv-tool 2>/dev/null)"
+      [[ -n "$prefix" && -f "$prefix/lib/libykcs11.dylib" ]] && path="$prefix/lib/libykcs11.dylib"
+      ;;
+    Linux)
+      if ! (ldconfig -p 2>/dev/null | grep -qi ykcs11); then
+        install_pkgs "" "yubico-piv-tool" "yubico-piv-tool"
+      fi
+      path="$(ldconfig -p 2>/dev/null | grep -im1 ykcs11 | awk '{print $NF}')"
+      ;;
+  esac
+  printf '%s' "$path"
+}
+
+# _next_numbered_dest <base-path>
+#
+# Collision-avoidance helper shared by encrypt_wizard.sh: if <base-path>
+# doesn't exist yet, echoes it unchanged. Otherwise echoes the same
+# path with "-2", "-3", ... spliced in before the extension (e.g.
+# env-config-cert.pem -> env-config-cert-2.pem), stopping at the first
+# name that isn't taken. Used so re-running the wizard with a second
+# physical YubiKey (a backup login key) never clobbers the first key's
+# cert/identity file in piv/ — both end up committed side by side.
+_next_numbered_dest() {
+  local base="$1" dir stem ext n dest
+  dir="$(dirname "$base")"
+  stem="$(basename "$base")"
+  if [[ "$stem" == *.* ]]; then
+    ext=".${stem##*.}"
+    stem="${stem%.*}"
+  else
+    ext=""
+  fi
+  if [[ ! -e "$base" ]]; then
+    printf '%s' "$base"
+    return 0
+  fi
+  n=2
+  while [[ -e "$dir/${stem}-${n}${ext}" ]]; do
+    n=$((n + 1))
+  done
+  printf '%s' "$dir/${stem}-${n}${ext}"
+}
+
+# regenerate_yubikey_ssh_pubkeys <piv_dir>
+#
+# For every piv/env-config-cert*.pem committed in <piv_dir> (the
+# bootstrap repo's own piv/ folder — one per physical YubiKey
+# provisioned via ./install.sh --encrypt; numbered when there's more
+# than one, e.g. a backup login key, see _next_numbered_dest() above),
+# regenerates the matching env-config*.pub into ~/.ssh/.env-config/ via
+# `ssh-keygen -f <cert> -i -m PKCS8`. Runs on every install, not just
+# --encrypt, so a fresh machine with only a git clone and the physical
+# YubiKey(s) in hand ends up with the same pubkey(s) as the machine
+# that originally ran the wizard — nothing here touches the private
+# key, the cert is public data by design (see README.md). Silently
+# does nothing if piv/ has no certs yet, or ssh-keygen isn't installed.
+regenerate_yubikey_ssh_pubkeys() {
+  local piv_dir="$1"
+  local piv_ssh_dir="$HOME/.ssh/.env-config"
+  command -v ssh-keygen >/dev/null 2>&1 || return 0
+  [[ -d "$piv_dir" ]] || return 0
+
+  local cert base pub_name pub_path found=0
+  for cert in "$piv_dir"/env-config-cert*.pem; do
+    [[ -f "$cert" ]] || continue
+    found=1
+    base="$(basename "$cert" .pem)"
+    base="${base/-cert/}"
+    pub_name="${base}.pub"
+    mkdir -p "$piv_ssh_dir"
+    chmod 700 "$piv_ssh_dir"
+    pub_path="$piv_ssh_dir/$pub_name"
+    if ssh-keygen -f "$cert" -i -m PKCS8 >"$pub_path.tmp" 2>/dev/null; then
+      mv "$pub_path.tmp" "$pub_path"
+      chmod 644 "$pub_path"
+      log "Regenerated $pub_path from $(basename "$cert")"
+    else
+      rm -f "$pub_path.tmp"
+      warn "Couldn't regenerate a pubkey from $cert — skipping it."
+    fi
+  done
+  if [[ "$found" == "0" ]]; then
+    log "No piv/env-config-cert*.pem found under $piv_dir — nothing to"
+    log "regenerate (run './install.sh --encrypt' first if you want"
+    log "YubiKey-backed SSH)."
+  fi
+}
+
+# wire_yubikey_ssh_config <alias:realhost> [alias:realhost...]
+#
+# Each argument is "ALIAS:REALHOST" — ALIAS is an SSH config Host
+# alias (e.g. "personal"), distinct from REALHOST, the actual hostname
+# it connects to (e.g. "github.com"). This alias indirection is what
+# lets gitconfig's `[url "ALIAS:PATH/"] insteadOf` rewrite ONLY your
+# own repos (whatever matches the insteadOf patterns) through the
+# YubiKey identity, while any other SSH connection to REALHOST — e.g.
+# cloning someone else's repo via a literal git@REALHOST:... URL that
+# doesn't match an insteadOf pattern — falls through to normal SSH
+# resolution instead of being forced through this key too.
+#
+# For the alias(es) given: writes (or rewrites) a Host block per alias
+# into a dedicated SSH-config-syntax file at
+# ~/.ssh/.env-config/config — deliberately not named *.env; an SSH
+# Include target has to be real ssh_config syntax, not a shell
+# KEY=VALUE file, so a .env-style name would misdescribe what's
+# actually in it. Ensures ~/.ssh/config exists and Include's that
+# file, prepended at the very top — Include has to come before any
+# catch-all "Host *" block further down in an existing config to
+# actually take effect. Fully regenerates the managed file every call,
+# so it always matches whatever alias list you pass — safe to re-run
+# (e.g. every time the 'git' item installs).
+#
+# Every env-config*.pub found under ~/.ssh/.env-config/ (regenerated by
+# regenerate_yubikey_ssh_pubkeys() from piv/env-config-cert*.pem — one
+# per physical YubiKey provisioned) gets its own IdentityFile line in
+# each Host block, primary key first. PKCS11Provider stays a single
+# line — it's a path to the shared PKCS#11 module, not tied to any one
+# physical key, so it works no matter which of the registered YubiKeys
+# is actually plugged in for a given connection; SSH just tries each
+# IdentityFile in turn until one matches what's inserted. This is what
+# makes a lost/broken primary key recoverable with a registered backup
+# instead of a hard lockout.
+wire_yubikey_ssh_config() {
+  local piv_ssh_dir="$HOME/.ssh/.env-config"
+  local pub_keys=() f numbered=()
+
+  [[ -f "$piv_ssh_dir/env-config.pub" ]] && pub_keys+=("$piv_ssh_dir/env-config.pub")
+  for f in "$piv_ssh_dir"/env-config-*.pub; do
+    [[ -f "$f" ]] && numbered+=("$f")
+  done
+  if [[ ${#numbered[@]} -gt 0 ]]; then
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && pub_keys+=("$f")
+    done < <(printf '%s\n' "${numbered[@]}" | sort)
+  fi
+
+  if [[ ${#pub_keys[@]} -eq 0 ]]; then
+    log "No env-config*.pub found under $piv_ssh_dir — YubiKey SSH key not"
+    log "provisioned yet (run the bootstrap repo's './install.sh --encrypt'"
+    log "first, or re-run install.sh so piv/env-config-cert*.pem gets"
+    log "regenerated into pubkeys here)."
+    return 0
+  fi
+
+  if [[ $# -eq 0 ]]; then
+    return 0
+  fi
+
+  local pkcs11_path
+  pkcs11_path="$(_yubikey_pkcs11_path)"
+  if [[ -z "$pkcs11_path" ]]; then
+    warn "Couldn't locate libykcs11 (the YubiKey's PKCS#11 module) — skipping"
+    warn "SSH config wiring. Find it yourself (e.g. 'brew --prefix yubico-piv-tool')"
+    warn "and add it to $piv_ssh_dir/config by hand."
+    return 0
+  fi
+
+  mkdir -p "$piv_ssh_dir"
+  chmod 700 "$piv_ssh_dir"
+  local snippet_file="$piv_ssh_dir/config"
+  {
+    echo "# Managed by install.sh's 'git' item — safe to regenerate by"
+    echo "# re-running it. Each Host below is an ALIAS (not the real"
+    echo "# hostname — see its HostName line), routed through the"
+    echo "# YubiKey's hardware-resident PIV key (slot 9a) instead of"
+    echo "# any file-based key. gitconfig rewrites your own repo URLs"
+    echo "# to use the alias — see that profile's git-config/gitconfig"
+    echo "# [url] block — so only those get this key; other SSH"
+    echo "# connections to the same real host aren't affected."
+    local pair alias_name realhost
+    for pair in "$@"; do
+      alias_name="${pair%%:*}"
+      realhost="${pair#*:}"
+      echo
+      echo "Host $alias_name"
+      echo "    HostName $realhost"
+      echo "    User git"
+      echo "    PKCS11Provider $pkcs11_path"
+      for f in "${pub_keys[@]}"; do
+        echo "    IdentityFile $f"
+      done
+      echo "    IdentitiesOnly yes"
+    done
+  } >"$snippet_file"
+  chmod 600 "$snippet_file"
+  local pub_key_names="" pk
+  for pk in "${pub_keys[@]}"; do
+    pub_key_names="$pub_key_names ${pk##*/}"
+  done
+  log "Wrote $snippet_file ($# alias(es): $*, ${#pub_keys[@]} YubiKey(s) wired:$pub_key_names)"
+
+  local ssh_dir="$HOME/.ssh" main_config="$HOME/.ssh/config"
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  if [[ ! -f "$main_config" ]]; then
+    log "No ~/.ssh/config found — creating one."
+    : >"$main_config"
+    chmod 600 "$main_config"
+  fi
+
+  if ! grep -qF "Include $snippet_file" "$main_config" 2>/dev/null; then
+    { echo "Include $snippet_file"; echo; cat "$main_config"; } >"$main_config.tmp"
+    mv "$main_config.tmp" "$main_config"
+    log "Added 'Include $snippet_file' to the top of ~/.ssh/config"
+  else
+    log "~/.ssh/config already includes $snippet_file."
+  fi
+
+  local first_alias="${1%%:*}"
+  log "Test with: ssh -T $first_alias"
+}
+
+# unwire_yubikey_ssh_config — reverse of wire_yubikey_ssh_config, used
+# by --uninstall. Removes the Include line from ~/.ssh/config (leaves
+# the rest of that file alone) and deletes the managed snippet file.
+# Never touches the YubiKey itself, env-config.pub, or anything under
+# ~/.ssh/.env-config/ besides that one generated config file.
+unwire_yubikey_ssh_config() {
+  local piv_ssh_dir="$HOME/.ssh/.env-config"
+  local snippet_file="$piv_ssh_dir/config"
+  local main_config="$HOME/.ssh/config"
+
+  if [[ -f "$main_config" ]] && grep -qF "Include $snippet_file" "$main_config" 2>/dev/null; then
+    grep -vF "Include $snippet_file" "$main_config" >"$main_config.tmp"
+    mv "$main_config.tmp" "$main_config"
+    log "Removed the Include line for $snippet_file from ~/.ssh/config."
+  fi
+  if [[ -f "$snippet_file" ]]; then
+    rm -f "$snippet_file"
+    log "Removed $snippet_file."
+  fi
+}

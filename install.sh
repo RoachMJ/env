@@ -303,6 +303,15 @@ if [[ -f "$AGE_BUNDLE" && -f "$AGE_IDENTITY" ]] &&
   fi
 fi
 
+# Regenerate env-config*.pub from piv/env-config-cert*.pem (one cert per
+# physical YubiKey provisioned via --encrypt, numbered when there's
+# more than one — see encrypt_wizard.sh). Both are public data; this
+# needs no decrypt and no private key, so it runs unconditionally,
+# ahead of each profile's install.sh 'git' item further down, which is
+# what actually wires the resulting pubkey(s) into ~/.ssh/config via
+# wire_yubikey_ssh_config().
+regenerate_yubikey_ssh_pubkeys "$SCRIPT_DIR/piv"
+
 # url_host <url> — bare host[:port], no scheme, no path.
 url_host() {
   local rest="${1#*://}"

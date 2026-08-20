@@ -37,9 +37,11 @@ run_encrypt_wizard() {
   _encrypt_ecc_slot
   _encrypt_build_bundle
 
-  log "Done. Review what changed (piv/repo.env.age, piv/age-identity.txt,"
-  log "piv/recipient) and commit it — install.sh's own source doesn't change:"
-  log "  git add piv/repo.env.age piv/age-identity.txt piv/recipient"
+  log "Done. Review what changed under piv/ (repo.env.age, age-identity.txt,"
+  log "recipient, env-config-cert.pem — numbered variants too if this is a"
+  log "second/backup YubiKey) and commit it — install.sh's own source"
+  log "doesn't change:"
+  log "  git add piv/"
   log "  git commit -m '🔐 provision YubiKey repo-access encryption'"
 }
 
@@ -160,6 +162,15 @@ _encrypt_ssh_slot() {
         ) || warn "Couldn't re-export the existing key — see output above."
         log "Public key (re-exported from the existing slot 9a key) written"
         log "to $ENCRYPTION_FILES_DIR/env-config.pub"
+        if [[ -f "$ENCRYPTION_FILES_DIR/env-config-cert.pem" ]]; then
+          mkdir -p "$SCRIPT_DIR/piv"
+          local piv_cert_dest
+          piv_cert_dest="$(_next_numbered_dest "$SCRIPT_DIR/piv/env-config-cert.pem")"
+          cp "$ENCRYPTION_FILES_DIR/env-config-cert.pem" "$piv_cert_dest"
+          log "Also copied to $piv_cert_dest — commit it (git add piv/) so"
+          log "install.sh can regenerate this pubkey on any machine from a"
+          log "bare clone plus this physical YubiKey."
+        fi
         return 0
         ;;
     esac
@@ -291,9 +302,20 @@ _encrypt_ssh_slot() {
   log "physical YubiKey present. There's no equivalent for the private key,"
   log "on purpose: it's generated on the YubiKey's own chip and never"
   log "leaves it, in any form — that's what \"hardware-backed\" means here."
+
+  mkdir -p "$SCRIPT_DIR/piv"
+  local piv_cert_dest
+  piv_cert_dest="$(_next_numbered_dest "$SCRIPT_DIR/piv/env-config-cert.pem")"
+  cp "$ENCRYPTION_FILES_DIR/env-config-cert.pem" "$piv_cert_dest"
+  log "Also copied to $piv_cert_dest — commit it (git add piv/) so"
+  log "install.sh can regenerate this pubkey on any machine from a bare"
+  log "clone plus this physical YubiKey, no wizard re-run needed there."
+
   log "For a backup login path, provision a second physical YubiKey (re-run"
-  log "this wizard with it inserted) and register both public keys, rather"
-  log "than looking for a private-key backup of this one."
+  log "this wizard with it inserted) — its cert lands in piv/ alongside"
+  log "this one (auto-numbered) and install.sh wires both in as valid"
+  log "IdentityFile entries, so losing either key alone doesn't lock you"
+  log "out. Register both public keys on your git host either way."
 }
 
 # Encryption key — one of age-plugin-yubikey's 20 "retired slots"
@@ -344,7 +366,19 @@ _encrypt_ecc_slot() {
 
   log "Recipient: $AGE_RECIPIENT"
   mkdir -p "$SCRIPT_DIR/piv"
-  cp "$ENCRYPTION_FILES_DIR/age-identity.txt" "$SCRIPT_DIR/piv/age-identity.txt"
+  local piv_identity_dest
+  piv_identity_dest="$(_next_numbered_dest "$SCRIPT_DIR/piv/age-identity.txt")"
+  cp "$ENCRYPTION_FILES_DIR/age-identity.txt" "$piv_identity_dest"
+  log "Copied to $piv_identity_dest"
+  if [[ "$piv_identity_dest" != "$SCRIPT_DIR/piv/age-identity.txt" ]]; then
+    warn "Note: install.sh's decrypt step only reads piv/age-identity.txt"
+    warn "(the unnumbered one) — this numbered copy is a record of the"
+    warn "second key, not yet an alternate decrypt path. repo.env.age"
+    warn "itself is still encrypted to whichever single recipient is in"
+    warn "piv/recipient (just overwritten above), so decrypt still needs"
+    warn "that specific key's YubiKey. Ask if you want multi-recipient"
+    warn "decrypt too — that's a bigger change to _encrypt_build_bundle."
+  fi
 
   # A short, well-known, plain-text file — not a literal edited into
   # install.sh's own source. It's a public key, so it's fine to commit;

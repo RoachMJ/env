@@ -1,0 +1,53 @@
+# OS / editor noise
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python venvs this repo's own tooling creates locally
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# install-manifest.jsonl / repo.env normally live in ~/.env-config,
+# structurally a sibling of this repo's own clone — never actually
+# inside this working tree by construction. Listed here anyway as
+# defense in depth in case ENVCFG_HOME/MANIFEST_FILE is ever pointed
+# somewhere unusual. See lib/common.sh's own comments on both.
+install-manifest.jsonl
+repo.env
+
+# ------------------------------------------------------------------
+# This repo is PUBLIC. Default-deny anything secret-shaped — the only
+# things meant to be tracked under piv/ are recipient, repo.env.age,
+# age-identity.txt (and numbered age-identity-2.txt, -3.txt, ... for a
+# second/backup physical YubiKey), and env-config-cert.pem (ditto,
+# numbered) — none of them are secret by design, see piv/README.md and
+# the root README's "how safe" writeup. Anything else that looks like
+# a credential is blocked; only allowlist a new file here if you're
+# certain it belongs in a public repo.
+# ------------------------------------------------------------------
+*.pem
+*.key
+*.p12
+*.pfx
+*.env
+repo.env
+repo.env.plain
+env-config.pub
+pubkey-9a.pem
+*token*
+*secret*
+
+# The one deliberate exception to *.pem above: env-config-cert.pem
+# (and numbered variants) is the X.509 certificate encrypt_wizard.sh
+# exports from PIV slot 9a — public key material only, never the
+# private key (which is hardware-resident and never leaves the
+# YubiKey). Committed so install.sh can regenerate env-config*.pub on
+# any machine from a bare clone plus the physical YubiKey — see
+# lib/common.sh's regenerate_yubikey_ssh_pubkeys().
+!piv/env-config-cert.pem
+!piv/env-config-cert-*.pem
