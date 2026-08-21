@@ -24,6 +24,43 @@
 log() { printf "\n\033[1;32m==>\033[0m %s\n" "$1"; }
 warn() { printf "\n\033[1;33m!!\033[0m %s\n" "$1"; }
 
+# NEXT_STEPS — in-memory only, never written to disk or committed.
+# next_step() warns immediately (exactly like warn()) AND queues the
+# same message so print_next_steps() can reprint the whole list, in
+# order, right before a profile install.sh's final "Done." line. Use
+# it instead of plain warn() for anything that genuinely needs a
+# follow-up action from you after the run finishes — a package that
+# failed to install, a manual one-time setup step, something not on
+# $PATH yet — not for purely informational messages. The point: a real
+# install run can print a hundred+ lines, so anything actionable that
+# only appeared once, scrolled past early on, is easy to lose — this
+# puts it back in front of you at the one place you're guaranteed to
+# still be looking, without you having to scroll back through
+# everything else to find what still needs doing.
+NEXT_STEPS=()
+next_step() {
+  warn "$1"
+  NEXT_STEPS+=("$1")
+}
+
+# print_next_steps — call once, right before "Done." No-op (prints
+# nothing) if nothing was queued this run, so a clean install stays
+# clean instead of always showing an empty "Next steps" header.
+print_next_steps() {
+  [[ ${#NEXT_STEPS[@]} -eq 0 ]] && return 0
+  echo
+  echo "============================================================"
+  echo " Next steps — ${#NEXT_STEPS[@]} thing(s) flagged during this run"
+  echo "============================================================"
+  local i=1 step
+  for step in "${NEXT_STEPS[@]}"; do
+    echo
+    echo "$i) $step"
+    i=$((i + 1))
+  done
+  echo
+}
+
 # All backups link_file() ever creates land here, not scattered next
 # to whatever they replaced. Lives inside ~/.env-config (same hidden
 # folder the repos get cloned into) but in its own backups/ subfolder,
@@ -159,6 +196,68 @@ link_file() {
   fi
   mkdir -p "$(dirname "$dest")"
   ln -sf "$src" "$dest"
+}
+
+# sync_config_overlay <format:json|toml> <repo_src> <dest> <overlay>
+#
+# Companion to link_file() for the handful of configs whose format has
+# no native include/import syntax — currently starship.toml, Codex's
+# config.toml, and Zed's settings.json/keymap.json. gitconfig,
+# tmux.conf.local, nvim/init.lua, and zshrc don't need this at all —
+# they each get a per-machine overlay for free via a native include/
+# source directive, so their destination stays a plain symlink. See
+# each profile's README, "Local machine overlays", for the full
+# explanation of why these four are different.
+#
+#   - No overlay file yet (the common case): behaves exactly like
+#     link_file() — dest becomes a plain symlink to repo_src, so a
+#     `git pull` in this repo propagates instantly, same as every
+#     other config here.
+#   - Overlay file present: dest becomes a REAL generated file (not a
+#     symlink) — repo_src merged with overlay via
+#     merge_config_overlay.py (~/.env-config/lib/, copied there by
+#     the bootstrap repo's install.sh), overlay winning on any
+#     conflicting key. Regenerated here at install time, and again
+#     automatically on your NEXT new terminal — each profile's zshrc
+#     calls the same script — so neither editing the overlay nor a
+#     `git pull` in this repo needs a re-run of install.sh to take
+#     effect. Never fatal: if python3 or the merge script itself
+#     isn't available, this falls back to the plain symlink and warns
+#     rather than failing the whole install.
+sync_config_overlay() {
+  local format="$1" src="$2" dest="$3" overlay="$4"
+  local merge_script="$HOME/.env-config/lib/merge_config_overlay.py"
+
+  if [[ ! -f "$overlay" ]]; then
+    link_file "$src" "$dest"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    next_step "$overlay exists but python3 isn't on \$PATH — can't merge it into $dest this run. Falling back to the plain tracked file. install.sh's neovim item pulls in python3; install it yourself and re-run to pick up this overlay."
+    link_file "$src" "$dest"
+    return 0
+  fi
+  if [[ ! -f "$merge_script" ]]; then
+    next_step "merge_config_overlay.py not found at $merge_script — can't merge $overlay into $dest this run. Falling back to the plain tracked file. Re-running the bootstrap repo's install.sh should restore it."
+    link_file "$src" "$dest"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$dest")"
+  # Deliberately NOT pre-removing an existing symlink/file at $dest
+  # here (switching from symlink mode to generated-file mode) —
+  # merge_config_overlay.py writes to "$dest.tmp" and only calls
+  # os.replace() over the real $dest once the merge has fully
+  # succeeded, which atomically replaces a symlink or a real file
+  # either way. Deleting $dest upfront would leave NOTHING there if
+  # the merge then failed (bad TOML/JSON in the overlay, etc.) —
+  # this way a failed merge leaves the previous working symlink or
+  # generated file untouched, exactly as the warning below claims.
+  if python3 "$merge_script" --format "$format" --base "$src" --overlay "$overlay" --dest "$dest"; then
+    log "Merged $overlay into $dest (overlay wins on any conflicting key)."
+  else
+    next_step "Failed to merge $overlay into $dest — check $overlay's syntax against $src. $dest was left as whatever it was before this run (a stale prior merge, if one existed)."
+  fi
 }
 
 # restore_file <dest> — the reverse of link_file. Deliberately does NOT
@@ -320,7 +419,16 @@ install_pkgs() {
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
       fi
       log "Installing via Homebrew: $mac_pkgs"
-      for pkg in $mac_pkgs; do install_pkg_one brew "$pkg"; done
+      # || true matters: install_pkg_one deliberately returns 1 for a
+      # single package that failed to install (after warning about it
+      # itself) so a caller COULD react — but this loop doesn't need to
+      # react per-package, and without the || true, that 1 is a bare
+      # command's non-zero exit inside a for-loop body, which set -e
+      # treats as fatal and kills this entire script right there,
+      # skipping every remaining package AND every item after this one.
+      # One bad formula (renamed, network blip, whatever) shouldn't take
+      # the whole install down with it.
+      for pkg in $mac_pkgs; do install_pkg_one brew "$pkg" || true; done
       ;;
     Linux)
       case "$PKG_MGR" in
@@ -331,12 +439,14 @@ install_pkgs() {
             _APT_UPDATED=1
           fi
           log "Installing via apt: $apt_pkgs"
-          for pkg in $apt_pkgs; do install_pkg_one apt "$pkg"; done
+          # See the brew loop's comment above — same reasoning applies.
+          for pkg in $apt_pkgs; do install_pkg_one apt "$pkg" || true; done
           ;;
         dnf)
           [[ -z "$dnf_pkgs" ]] && return 0
           log "Installing via dnf: $dnf_pkgs"
-          for pkg in $dnf_pkgs; do install_pkg_one dnf "$pkg"; done
+          # See the brew loop's comment above — same reasoning applies.
+          for pkg in $dnf_pkgs; do install_pkg_one dnf "$pkg" || true; done
           ;;
         *)
           [[ -z "$apt_pkgs" && -z "$dnf_pkgs" ]] && return 0
@@ -587,10 +697,7 @@ ensure_age_decrypt_tools() {
   install_pkgs "${mac_missing[*]:-}" "${apt_missing[*]:-}" ""
 
   if ! command -v age-plugin-yubikey >/dev/null 2>&1; then
-    warn "age-plugin-yubikey still not found after install — install manually:"
-    warn "  cargo install age-plugin-yubikey   (needs Rust/cargo)"
-    warn "  or grab a release from https://github.com/str4d/age-plugin-yubikey/releases"
-    warn "Falling back to plaintext repo URLs this run."
+    next_step "age-plugin-yubikey still not found after install — install manually: cargo install age-plugin-yubikey (needs Rust/cargo), or grab a release from https://github.com/str4d/age-plugin-yubikey/releases. Falling back to plaintext repo URLs this run."
   fi
 }
 
@@ -881,24 +988,19 @@ wire_yubikey_ssh_config() {
     done < <(printf '%s\n' "${numbered[@]}" | sort)
   fi
 
-  if [[ ${#pub_keys[@]} -eq 0 ]]; then
-    log "No env-config*.pub found under $piv_ssh_dir — YubiKey SSH key not"
-    log "provisioned yet (run the bootstrap repo's './install.sh --encrypt'"
-    log "first, or re-run install.sh so piv/env-config-cert*.pem gets"
-    log "regenerated into pubkeys here)."
+  if [[ $# -eq 0 ]]; then
     return 0
   fi
 
-  if [[ $# -eq 0 ]]; then
+  if [[ ${#pub_keys[@]} -eq 0 ]]; then
+    next_step "No env-config*.pub found under $piv_ssh_dir — YubiKey SSH key not provisioned yet. Run the bootstrap repo's './install.sh --encrypt' first, or re-run install.sh so piv/env-config-cert*.pem gets regenerated into pubkeys here."
     return 0
   fi
 
   local pkcs11_path
   pkcs11_path="$(_yubikey_pkcs11_path)"
   if [[ -z "$pkcs11_path" ]]; then
-    warn "Couldn't locate libykcs11 (the YubiKey's PKCS#11 module) — skipping"
-    warn "SSH config wiring. Find it yourself (e.g. 'brew --prefix yubico-piv-tool')"
-    warn "and add it to $piv_ssh_dir/config by hand."
+    next_step "Couldn't locate libykcs11 (the YubiKey's PKCS#11 module) — skipping SSH config wiring. Find it yourself (e.g. 'brew --prefix yubico-piv-tool') and add it to $piv_ssh_dir/config by hand."
     return 0
   fi
 

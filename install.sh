@@ -457,6 +457,18 @@ for p in "${PROFILES[@]}"; do
   clone_or_pull_profile "$p"
 done
 
+# Deploy merge_config_overlay.py (lib/) to a stable, repo-independent
+# path — ~/.env-config/lib/, alongside the backups/ dir lib/common.sh
+# already uses. Profile install.sh's sync_config_overlay() calls it
+# from there, and each profile's zshrc calls it again on every new
+# terminal (see "Local machine overlays" in each profile's README) —
+# both need a path that survives even if this bootstrap repo folder
+# ever gets moved or deleted after the initial install. Copied, not
+# symlinked, for exactly that reason — a symlink back into this repo
+# would break the moment this repo folder goes away.
+mkdir -p "$ENVCFG_HOME/lib"
+cp "$SCRIPT_DIR/lib/merge_config_overlay.py" "$ENVCFG_HOME/lib/merge_config_overlay.py"
+
 # 4. Hand off to each profile's own install.sh — generic dispatch,
 #    no component knowledge here.
 for p in "${PROFILES[@]}"; do
@@ -473,4 +485,5 @@ for p in "${PROFILES[@]}"; do
   fi
 done
 
+print_next_steps
 log "Done."

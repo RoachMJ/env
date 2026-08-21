@@ -92,10 +92,17 @@ else
     [[ "$OS_KERNEL" == "Linux" ]] && command -v apt-get >/dev/null 2>&1 && PKG_MGR="apt"
   }
   install_pkgs() {
+    # || true on both branches matters under this script's `set -e`: a
+    # bare failing command here (a renamed formula, a network blip)
+    # would otherwise kill this whole script instead of just that one
+    # package install — see lib/common.sh's real install_pkgs/
+    # install_pkg_one for the fuller version of this same idea (per-
+    # package pre-existence check + manifest recording), which any real
+    # profile install.sh should use instead of this minimal stub.
     local mac_pkgs="$1" apt_pkgs="$2"
     case "$OS_KERNEL" in
-      Darwin) [[ -n "$mac_pkgs" ]] && brew install $mac_pkgs ;;
-      Linux) [[ -n "$apt_pkgs" ]] && sudo apt-get install -y $apt_pkgs ;;
+      Darwin) [[ -n "$mac_pkgs" ]] && { brew install $mac_pkgs || echo "warn: brew install failed for: $mac_pkgs" >&2; } ;;
+      Linux) [[ -n "$apt_pkgs" ]] && { sudo apt-get install -y $apt_pkgs || echo "warn: apt-get install failed for: $apt_pkgs" >&2; } ;;
     esac
   }
 fi
