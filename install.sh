@@ -378,6 +378,19 @@ ssh_to_https() {
 clone_or_pull_profile() {
   local profile="$1" profile_dir="$ENVCFG_HOME/$1"
   local repo_url="" short upper ssh_var url_var auth_note
+  # Stays empty (no token_args) unless REPO_ACCESS_TOKEN is set below —
+  # both git invocations reference it as
+  # "${token_args[@]+"${token_args[@]}"}", not the plain
+  # "${token_args[@]}" you'd expect. That's deliberate, not a typo:
+  # macOS ships bash 3.2 as /bin/bash (last GPLv2 release, still the
+  # default on every Mac), and 3.2 treats "${arr[@]}" on a
+  # zero-element array as an unset variable under `set -u` — this
+  # whole script's set -euo pipefail at the top would hard-exit with
+  # "token_args[@]: unbound variable" on any machine using stock
+  # /bin/bash the moment REPO_ACCESS_TOKEN isn't set (i.e. almost
+  # always, since it's optional). The ${arr[@]+word} form is the
+  # standard portable workaround — it only expands when the array
+  # actually has elements, and doesn't trip the unset check either way.
   local -a token_args=()
 
   # "env-personal" -> "personal" -> "PERSONAL"; "env-professional" ->
@@ -411,7 +424,7 @@ clone_or_pull_profile() {
 
   if [[ -d "$profile_dir" && -d "$profile_dir/.git" ]]; then
     log "'$profile' already cloned — pulling latest (shallow)"
-    if ! git "${token_args[@]}" -C "$profile_dir" pull --ff-only >/tmp/profile_pull.log 2>&1; then
+    if ! git "${token_args[@]+"${token_args[@]}"}" -C "$profile_dir" pull --ff-only >/tmp/profile_pull.log 2>&1; then
       warn "git pull in $profile_dir failed — continuing with what's already on disk:"
       sed 's/^/    /' /tmp/profile_pull.log
     fi
@@ -433,7 +446,7 @@ clone_or_pull_profile() {
   log "Shallow-cloning '$profile' from:"
   log "  $repo_url"
   log "  ($auth_note)"
-  if ! git "${token_args[@]}" clone --depth 1 "$repo_url" "$profile_dir"; then
+  if ! git "${token_args[@]+"${token_args[@]}"}" clone --depth 1 "$repo_url" "$profile_dir"; then
     echo "Clone of $repo_url into $profile_dir failed — check the URL and your" >&2
     echo "auth (SSH key loaded / REPO_ACCESS_TOKEN valid) and try again." >&2
     exit 1

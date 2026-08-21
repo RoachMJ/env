@@ -127,7 +127,13 @@ _secret_check_age_tools() {
   [[ "$need_plugin" == "1" ]] && mac_missing+=(age-plugin-yubikey)
   # apt has no age-plugin-yubikey package — Linux users needing it fall
   # through to the manual cargo/GitHub-release instructions below.
-  install_pkgs "${mac_missing[*]}" "${apt_missing[*]}" ""
+  # "${arr[*]:-}", not plain "${arr[*]}": either array can genuinely be
+  # empty here (e.g. only age-plugin-yubikey missing -> apt_missing
+  # stays empty), and macOS's stock /bin/bash (3.2) treats an empty
+  # array reference as unset under this script's `set -u`. `:-`
+  # explicitly asks for the empty-string fallback, which is also
+  # exactly what install_pkgs expects for "nothing to install" here.
+  install_pkgs "${mac_missing[*]:-}" "${apt_missing[*]:-}" ""
 
   if ! command -v age-plugin-yubikey >/dev/null 2>&1; then
     warn "age-plugin-yubikey not found via package manager — install manually:"
