@@ -324,9 +324,12 @@ archdocs render examples/platform_stack.py [--drawio]
 <details>
 <summary>Neovim plugins</summary>
 
+The colorscheme (Desert Mesa) isn't in this table — it's a bundled
+`colors/desert-mesa.lua` file, not a third-party plugin, so there's
+nothing external to install or keep in sync for it.
+
 | Plugin | For |
 |---|---|
-| catppuccin | colorscheme |
 | nvim-tree | file explorer |
 | telescope.nvim (+fzf-native, +ui-select) | fuzzy find; renders Codex's approval prompts |
 | gitsigns.nvim | gutter diff signs, hunk stage/undo |

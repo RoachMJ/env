@@ -85,6 +85,49 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---------------------- MyEnv startup banner --------------------------
+# Same art/palette (Desert Mesa) as the zshrc banner each profile
+# installs later. Version comes from this repo's own git tag —
+# reads "dev" pre-tag, e.g. on a fresh clone with no releases cut yet.
+_myenv_version() {
+  local tag
+  tag="$(git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null)"
+  if [[ -n "$tag" ]]; then
+    printf '%s\n' "$tag"
+  else
+    printf '%s\n' "dev"
+  fi
+}
+
+myenv_banner() {
+  printf '\n\n\n\n\n'
+  printf '%b\n' '\033[38;2;192;82;58m███╗   \033[38;2;214;138;76m███╗   \033[38;2;217;181;104m      █\033[38;2;147;163;95m██████\033[38;2;95;138;130m╗███╗  \033[38;2;91;107;122m ██╗██╗\033[38;2;232;217;181m   ██╗\033[0m'
+  printf '%b\n' '\033[38;2;192;82;58m████╗ █\033[38;2;214;138;76m███║   \033[38;2;217;181;104m      █\033[38;2;147;163;95m█╔════\033[38;2;95;138;130m╝████╗ \033[38;2;91;107;122m ██║██║\033[38;2;232;217;181m   ██║\033[0m'
+  printf '%b\n' '\033[38;2;192;82;58m██╔████\033[38;2;214;138;76m╔██║██╗\033[38;2;217;181;104m   ██╗█\033[38;2;147;163;95m████╗ \033[38;2;95;138;130m ██╔██╗\033[38;2;91;107;122m ██║██║\033[38;2;232;217;181m   ██║\033[0m'
+  printf '%b\n' '\033[38;2;192;82;58m██║╚██╔\033[38;2;214;138;76m╝██║╚██\033[38;2;217;181;104m╗ ██╔╝█\033[38;2;147;163;95m█╔══╝ \033[38;2;95;138;130m ██║╚██\033[38;2;91;107;122m╗██║╚██\033[38;2;232;217;181m╗ ██╔╝\033[0m'
+  printf '%b\n' '\033[38;2;192;82;58m██║ ╚═╝\033[38;2;214;138;76m ██║ ╚█\033[38;2;217;181;104m███╔╝ █\033[38;2;147;163;95m██████\033[38;2;95;138;130m╗██║ ╚█\033[38;2;91;107;122m███║ ╚█\033[38;2;232;217;181m███╔╝ \033[0m'
+  printf '%b\n' '\033[38;2;192;82;58m╚═╝    \033[38;2;214;138;76m ╚═╝  ╚\033[38;2;217;181;104m██╔╝  ╚\033[38;2;147;163;95m══════\033[38;2;95;138;130m╝╚═╝  ╚\033[38;2;91;107;122m═══╝  ╚\033[38;2;232;217;181m═══╝  \033[0m'
+  printf '%b\n' '\033[38;2;192;82;58m       \033[38;2;214;138;76m     ██\033[38;2;217;181;104m╔╝     \033[38;2;147;163;95m      \033[38;2;95;138;130m       \033[38;2;91;107;122m       \033[38;2;232;217;181m      \033[0m'
+
+  printf '%b\n' '                  \033[38;2;217;181;104mWorks fine on MyENV. Ship it.\033[0m'
+  local ver_text
+  ver_text="$(_myenv_version)"
+  local pad=$(( 47 - ${#ver_text} ))
+  (( pad < 0 )) && pad=0
+  printf '%*s' "$pad" ''
+  printf '\033[38;2;138;127;108m%s\033[0m\n' "$ver_text"
+  echo
+}
+
+myenv_banner
+
+# Give it a beat before the package checks start scrolling — only when
+# there's a real terminal to wait on, so piped/non-interactive runs
+# (curl | bash, CI, --all) never hang here.
+if [[ -t 0 ]]; then
+  read -r -p "Press Enter to continue... " _
+fi
+
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 

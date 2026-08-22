@@ -331,6 +331,128 @@ detect_os() {
 
 _APT_UPDATED=0
 
+# _has_sudo_access — true if this user is in a group that plausibly
+# grants sudo (sudo/wheel/admin), false otherwise. Deliberately does
+# NOT call the real `sudo` binary at all (not even `sudo -n true`) —
+# that idiom still invokes the genuine PAM/sudo stack and gets logged
+# by auditd/syslog exactly like any other attempt on a monitored
+# system, so it doesn't actually avoid the thing this check exists to
+# avoid. Pure group-membership inspection via `id -nG` has zero side
+# effects. This is a heuristic, not a guarantee — a system that grants
+# sudo via a direct per-user /etc/sudoers entry with no group involved
+# will false-negative here — but that's the safe direction to be
+# wrong in: we skip a real sudo call rather than risk a logged failed
+# one.
+_has_sudo_access() {
+  local groups grp
+  groups="$(id -nG 2>/dev/null)" || return 1
+  for grp in sudo wheel admin; do
+    case " $groups " in
+      *" $grp "*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# run_sudo <cmd...> — drop-in replacement for a bare `sudo <cmd...>`
+# call. Checks _has_sudo_access first; if this user isn't in a
+# sudo-granting group, skips running sudo entirely (warning why)
+# instead of letting a real attempt fail and potentially get logged.
+# Returns 1 in both the "no access" and "command failed" cases, so
+# existing `sudo ... || next_step "..."` call-site patterns work
+# unchanged after a straight `sudo` -> `run_sudo` rename.
+run_sudo() {
+  if ! _has_sudo_access; then
+    warn "  skipping 'sudo $*' — not in the sudo/wheel/admin group on this machine, so this would just fail (and may get logged/flagged on a monitored system) rather than work. Ask an admin to grant access, or run this manually if you know otherwise: sudo $*"
+    return 1
+  fi
+  sudo "$@"
+}
+
+# ------------------------------------------------------------------
+# Homebrew cask sudo avoidance (macOS only) — Homebrew itself never
+# needs sudo for `brew install` of a formula or a normal app-bundle
+# cask, PROVIDED it's writing somewhere the current user already owns.
+# Two distinct situations actually trigger an admin/sudo prompt:
+#   1. An app-bundle cask (Zed, Codex — anything using Cask's default
+#      "app" stanza) moving into /Applications on a machine where that
+#      directory isn't group-writable by this account (locked-down
+#      Mac, MDM-managed, non-admin account). Fully avoidable — Cask
+#      has always supported --appdir to redirect installs somewhere
+#      under $HOME that this account already owns outright.
+#   2. A .pkg-based cask (git-credential-manager is the one in this
+#      repo) whose installer is a real macOS Installer.app package —
+#      those run via `installer -pkg ... -target /`, which needs root
+#      no matter where --appdir points; --appdir doesn't apply to pkg
+#      casks at all. Not avoidable, only askable.
+# ------------------------------------------------------------------
+
+# prompt_cask_appdir — interactive, asked at most once per run
+# (memoized via _CASK_APPDIR_ASKED). Exports HOMEBREW_CASK_OPTS so the
+# choice applies to every `brew install --cask` call for the rest of
+# this run — harmless for casks that ignore appdir (fonts install
+# into ~/Library/Fonts regardless; .pkg casks ignore it per the note
+# above). Call this once, early, before the first app-bundle cask item
+# runs — NOT before every individual cask call.
+_CASK_APPDIR_ASKED=""
+prompt_cask_appdir() {
+  [[ "$OS_KERNEL" == "Darwin" ]] || return 0
+  [[ -n "$_CASK_APPDIR_ASKED" ]] && return 0
+  _CASK_APPDIR_ASKED=1
+
+  if [[ ! -t 0 ]]; then
+    CASK_APPDIR="$HOME/Applications"
+    mkdir -p "$CASK_APPDIR"
+    export HOMEBREW_CASK_OPTS="--appdir=$CASK_APPDIR"
+    log "No TTY — defaulting Homebrew Cask app installs to $CASK_APPDIR (avoids an admin/sudo prompt)."
+    return 0
+  fi
+
+  echo
+  log "Where should Homebrew Cask install applications (Zed, Codex)?"
+  log "/Applications (Homebrew's default) can require an admin password to"
+  log "write to on a locked-down Mac — picking a folder under your home"
+  log "directory avoids that prompt entirely."
+  echo "  1) Desktop        (~/Desktop)"
+  echo "  2) ~/Apps         (created if missing — recommended, default)"
+  echo "  3) Custom path"
+  echo "  4) /Applications  (Homebrew's default — may prompt for a password)"
+  read -r -p "  Choice [2]: " appdir_choice
+  case "${appdir_choice:-2}" in
+    1) CASK_APPDIR="$HOME/Desktop" ;;
+    3)
+      read -r -p "  Path: " cask_custom_dir
+      CASK_APPDIR="${cask_custom_dir/#\~/$HOME}"
+      [[ -n "$CASK_APPDIR" ]] || CASK_APPDIR="$HOME/Apps"
+      ;;
+    4) CASK_APPDIR="/Applications" ;;
+    *) CASK_APPDIR="$HOME/Apps" ;;
+  esac
+
+  [[ "$CASK_APPDIR" == "/Applications" ]] || mkdir -p "$CASK_APPDIR"
+  export HOMEBREW_CASK_OPTS="--appdir=$CASK_APPDIR"
+  log "Cask apps will install to $CASK_APPDIR"
+}
+
+# confirm_brew_sudo <reason> — explicit, per-call-site interactive
+# gate for the one case appdir can't fix: a .pkg-based cask that
+# genuinely needs admin/sudo no matter what. Asks once per call site
+# (not memoized globally — a "no" to one pkg cask shouldn't silently
+# answer for a different one later). Errs toward declining when there
+# is no TTY to ask, rather than letting brew hang on a hidden password
+# prompt or risk a logged attempt on a monitored system.
+confirm_brew_sudo() {
+  local reason="$1"
+  if [[ ! -t 0 ]]; then
+    warn "$reason This needs your explicit OK and there's no TTY to ask, so skipping — install manually if you want it."
+    return 1
+  fi
+  echo
+  warn "$reason"
+  read -r -p "  Allow Homebrew to prompt for your admin/sudo password to install this? [y/N] " ans_brew_sudo
+  [[ "$ans_brew_sudo" =~ ^[Yy] ]]
+}
+
 # _pkg_installed <manager> <name> — true if already present. Checked
 # BEFORE every install below so the manifest can distinguish "this run
 # installed it" from "you already had it" — that distinction is the
@@ -347,7 +469,87 @@ _pkg_installed() {
   esac
 }
 
-# install_pkg_one <manager> <name>
+# ------------------------------------------------------------------
+# Noise suppression + a visual "still working" indicator — brew/apt/
+# dnf/npm/curl installs are extremely chatty (download progress,
+# "Pouring bottle", dependency trees, etc.), and that scroll buries
+# the two things that actually matter: a prompt that's genuinely
+# waiting on you, and an error when something breaks.
+# ------------------------------------------------------------------
+
+# _progress_bar <current> <total> — plain-ASCII "[####------]" bar
+# (no unicode block glyphs) so it renders correctly in any terminal,
+# including minimal/serial-console ones. total<=0 prints an empty
+# bar rather than dividing by zero — callers that don't know a total
+# up front (a single one-off install, not a loop over a package list)
+# just skip calling this and get a bare spinner from run_quiet instead.
+_progress_bar() {
+  local cur="$1" total="$2" width=20 filled i bar=""
+  if ((total <= 0)); then
+    printf '[%*s]' "$width" ""
+    return
+  fi
+  filled=$((cur * width / total))
+  for ((i = 0; i < width; i++)); do
+    if ((i < filled)); then bar+="#"; else bar+="-"; fi
+  done
+  printf '[%s]' "$bar"
+}
+
+# run_quiet <label> <cmd...> — runs <cmd...> with its stdout/stderr
+# captured to a temp file instead of spilling onto the terminal, shows
+# a spinner next to <label> while it's running (skipped when stdout
+# isn't a TTY — a log file or CI just gets <label> logged once
+# instead), then either replaces the spinner with a clean one-line
+# result (success) or dumps the FULL captured output (failure) — only
+# the happy path is quiet; the diagnosis never is.
+#
+# stdin is deliberately left connected to the real terminal, not
+# redirected, so a subprocess that's genuinely blocked waiting on
+# input can still read it — but its prompt text is inside the
+# redirected output, invisible until failure. Every package-manager
+# call in this repo already passes an unattended flag for exactly
+# this reason (apt/dnf -y, HOMEBREW_NO_AUTO_UPDATE, npm's
+# non-interactive defaults) — this wrapper assumes that convention
+# holds rather than trying to detect/forward a live prompt itself.
+# Ctrl-C still interrupts normally (SIGINT reaches the whole process
+# group, not just this function).
+run_quiet() {
+  local label="$1"
+  shift
+  local logfile rc=0 pid frames='|/-\' i=0
+  logfile="$(mktemp "${TMPDIR:-/tmp}/envcfg-install.XXXXXX")"
+
+  ("$@") >"$logfile" 2>&1 &
+  pid=$!
+
+  if [[ -t 1 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      i=$(((i + 1) % 4))
+      printf "\r  [%s] %s" "${frames:$i:1}" "$label"
+      sleep 0.15
+    done
+    wait "$pid" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf "\r\033[K  [ok]   %s\n" "$label"
+    else
+      printf "\r\033[K  [FAIL] %s (exit %d)\n" "$label" "$rc"
+    fi
+  else
+    log "  $label"
+    wait "$pid" || rc=$?
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    echo "  ---- output: $label ----"
+    sed 's/^/    /' "$logfile"
+    echo "  --------------------------------"
+  fi
+  rm -f "$logfile"
+  return "$rc"
+}
+
+# install_pkg_one <manager> <name> [<idx> <total>]
 #
 # Per-package install with a pre-existence check and a manifest entry
 # either way (pre_existing:true if it was already there — nothing
@@ -358,19 +560,24 @@ _pkg_installed() {
 # record_manual_install instead — see that function's comment). Public
 # on its own (not just via install_pkgs below) for call sites that need
 # to install a single package outside a mac/apt/dnf triple, e.g. the
-# 'lint' item's per-tool loop.
+# 'lint' item's per-tool loop. <idx>/<total> are optional — when a
+# caller (install_pkgs, below) knows it's looping over a package list,
+# passing them decorates the spinner with a "[3/12]" progress bar;
+# omitted, it's just a bare spinner.
 install_pkg_one() {
-  local mgr="$1" pkg="$2"
+  local mgr="$1" pkg="$2" idx="${3:-0}" total="${4:-0}" label="installing $pkg"
+  if ((total > 0)); then
+    label="$(_progress_bar "$idx" "$total") ($idx/$total) installing $pkg"
+  fi
   if _pkg_installed "$mgr" "$pkg"; then
     log "  already installed: $pkg"
     _manifest_append "\"type\":\"package\",\"manager\":\"$mgr\",\"name\":\"$(_json_escape "$pkg")\",\"pre_existing\":true"
     return 0
   fi
-  log "  installing $pkg"
   case "$mgr" in
-    brew) HOMEBREW_NO_AUTO_UPDATE=1 brew install "$pkg" || { warn "  failed to install $pkg"; return 1; } ;;
-    apt) sudo apt-get install -y --no-install-recommends "$pkg" || { warn "  failed to install $pkg"; return 1; } ;;
-    dnf) sudo dnf install -y --setopt=install_weak_deps=False "$pkg" || { warn "  failed to install $pkg"; return 1; } ;;
+    brew) run_quiet "$label" env HOMEBREW_NO_AUTO_UPDATE=1 brew install "$pkg" || { warn "  failed to install $pkg"; return 1; } ;;
+    apt) run_quiet "$label" run_sudo apt-get install -y --no-install-recommends "$pkg" || { warn "  failed to install $pkg"; return 1; } ;;
+    dnf) run_quiet "$label" run_sudo dnf install -y --setopt=install_weak_deps=False "$pkg" || { warn "  failed to install $pkg"; return 1; } ;;
     *) warn "  install_pkg_one: unknown manager '$mgr' for $pkg"; return 1 ;;
   esac
   _manifest_append "\"type\":\"package\",\"manager\":\"$mgr\",\"name\":\"$(_json_escape "$pkg")\",\"pre_existing\":false"
@@ -410,13 +617,12 @@ install_pkg_one() {
 # wasn't part of this call — `apt-get install`/`dnf install`/
 # `brew install` only touch the names you pass them.
 install_pkgs() {
-  local mac_pkgs="$1" apt_pkgs="$2" dnf_pkgs="$3" pkg
+  local mac_pkgs="$1" apt_pkgs="$2" dnf_pkgs="$3" pkg _idx _total
   case "$OS_KERNEL" in
     Darwin)
       [[ -z "$mac_pkgs" ]] && return 0
       if ! command -v brew >/dev/null 2>&1; then
-        log "Installing Homebrew"
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        run_quiet "installing Homebrew" /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
       fi
       log "Installing via Homebrew: $mac_pkgs"
       # || true matters: install_pkg_one deliberately returns 1 for a
@@ -428,25 +634,37 @@ install_pkgs() {
       # skipping every remaining package AND every item after this one.
       # One bad formula (renamed, network blip, whatever) shouldn't take
       # the whole install down with it.
-      for pkg in $mac_pkgs; do install_pkg_one brew "$pkg" || true; done
+      _total=$(wc -w <<<"$mac_pkgs") _idx=0
+      for pkg in $mac_pkgs; do
+        _idx=$((_idx + 1))
+        install_pkg_one brew "$pkg" "$_idx" "$_total" || true
+      done
       ;;
     Linux)
       case "$PKG_MGR" in
         apt)
           [[ -z "$apt_pkgs" ]] && return 0
           if [[ "$_APT_UPDATED" == "0" ]]; then
-            sudo apt-get update
+            run_quiet "apt-get update" run_sudo apt-get update
             _APT_UPDATED=1
           fi
           log "Installing via apt: $apt_pkgs"
           # See the brew loop's comment above — same reasoning applies.
-          for pkg in $apt_pkgs; do install_pkg_one apt "$pkg" || true; done
+          _total=$(wc -w <<<"$apt_pkgs") _idx=0
+          for pkg in $apt_pkgs; do
+            _idx=$((_idx + 1))
+            install_pkg_one apt "$pkg" "$_idx" "$_total" || true
+          done
           ;;
         dnf)
           [[ -z "$dnf_pkgs" ]] && return 0
           log "Installing via dnf: $dnf_pkgs"
           # See the brew loop's comment above — same reasoning applies.
-          for pkg in $dnf_pkgs; do install_pkg_one dnf "$pkg" || true; done
+          _total=$(wc -w <<<"$dnf_pkgs") _idx=0
+          for pkg in $dnf_pkgs; do
+            _idx=$((_idx + 1))
+            install_pkg_one dnf "$pkg" "$_idx" "$_total" || true
+          done
           ;;
         *)
           [[ -z "$apt_pkgs" && -z "$dnf_pkgs" ]] && return 0
@@ -510,7 +728,7 @@ _core_package_update_available() {
     Linux)
       if [[ -n "$apt_pkg" && "$PKG_MGR" == "apt" ]]; then
         if [[ "$_APT_UPDATED" == "0" ]]; then
-          sudo apt-get update >/dev/null 2>&1 || true
+          run_sudo apt-get update >/dev/null 2>&1 || true
           _APT_UPDATED=1
         fi
         apt list --upgradable 2>/dev/null | grep -q "^${apt_pkg}/"
@@ -596,8 +814,7 @@ offer_core_package() {
 _install_core_package() {
   local label="$1" bin="$2" mac_pkg="$3" apt_pkg="$4" dnf_pkg="$5"
   if [[ "$OS_KERNEL" == "Linux" && -z "$apt_pkg$dnf_pkg" ]]; then
-    log "Installing $label via its official installer (no reliable apt/dnf package)"
-    curl -sS "https://starship.rs/install.sh" | sh -s -- -y ||
+    run_quiet "installing $label (official installer)" bash -c 'curl -sS "https://starship.rs/install.sh" | sh -s -- -y' ||
       warn "$label install script failed — see its own install docs."
     return 0
   fi
@@ -608,25 +825,21 @@ _upgrade_core_package() {
   local label="$1" bin="$2" mac_pkg="$3" apt_pkg="$4" dnf_pkg="$5"
   case "$OS_KERNEL" in
     Darwin)
-      log "Upgrading $label via Homebrew"
-      HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade "$mac_pkg" ||
+      run_quiet "upgrading $label via Homebrew" env HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade "$mac_pkg" ||
         warn "brew upgrade $mac_pkg reported an issue — check output above."
       ;;
     Linux)
       if [[ -z "$apt_pkg$dnf_pkg" ]]; then
-        log "Upgrading $label via its official installer (no reliable apt/dnf package)"
-        curl -sS "https://starship.rs/install.sh" | sh -s -- -y ||
+        run_quiet "upgrading $label (official installer)" bash -c 'curl -sS "https://starship.rs/install.sh" | sh -s -- -y' ||
           warn "$label upgrade failed — see its own install docs."
       elif [[ "$PKG_MGR" == "apt" ]]; then
         if [[ "$_APT_UPDATED" == "0" ]]; then
-          sudo apt-get update
+          run_quiet "apt-get update" run_sudo apt-get update
           _APT_UPDATED=1
         fi
-        log "Upgrading $label via apt"
-        sudo apt-get install -y --only-upgrade "$apt_pkg"
+        run_quiet "upgrading $label via apt" run_sudo apt-get install -y --only-upgrade "$apt_pkg"
       elif [[ "$PKG_MGR" == "dnf" ]]; then
-        log "Upgrading $label via dnf"
-        sudo dnf upgrade -y "$dnf_pkg"
+        run_quiet "upgrading $label via dnf" run_sudo dnf upgrade -y "$dnf_pkg"
       else
         warn "Unrecognized package manager — upgrade $label manually."
       fi
@@ -731,6 +944,27 @@ manifest_packages_for_item() {
     sort -u || true
 }
 
+# manifest_has_item <item> — true if install-manifest.jsonl has ANY
+# entry at all (symlink, package, or cloned_repo — not just packages,
+# unlike manifest_packages_for_item above) recorded against <item> for
+# $CURRENT_PROFILE specifically, from any previous run. Scoped to the
+# current profile — install-manifest.jsonl is one file, but a machine
+# that's run both env-personal and env-professional at some point would
+# otherwise cross-contaminate: both profiles share several item key
+# names (neovim, tmux, zshrc, git, gpg, zed, codex), and "you installed
+# personal's neovim before" shouldn't make professional's install.sh
+# think ITS neovim item has history too. Used to detect "a previous run
+# installed this, but it's not selected this time" — see each profile's
+# install.sh, right after the --uninstall dispatch. Relies on
+# _manifest_append's fixed field order ("profile" always immediately
+# before "item") rather than a more elaborate JSON-aware match — this
+# file is append-only and single-writer, so that ordering is guaranteed.
+manifest_has_item() {
+  local item="$1"
+  [[ -f "$MANIFEST_FILE" ]] || return 1
+  grep -q "\"profile\":\"$(_json_escape "$CURRENT_PROFILE")\",\"item\":\"$(_json_escape "$item")\"" "$MANIFEST_FILE" 2>/dev/null
+}
+
 # uninstall_package <manager> <name> — reverse of one install_pkg_one
 # call (or record_manual_install "package" call). Best-effort: reports
 # a failed removal and moves on rather than aborting the whole
@@ -746,9 +980,9 @@ uninstall_package() {
   case "$mgr" in
     brew) brew uninstall "$name" 2>&1 | sed 's/^/    /' || true ;;
     brew_cask) brew uninstall --cask "$name" 2>&1 | sed 's/^/    /' || true ;;
-    apt) sudo apt-get remove -y "$name" 2>&1 | sed 's/^/    /' || true ;;
-    dnf) sudo dnf remove -y "$name" 2>&1 | sed 's/^/    /' || true ;;
-    npm_global) (sudo npm uninstall -g "$name" 2>&1 || npm uninstall -g "$name" 2>&1) | sed 's/^/    /' || true ;;
+    apt) run_sudo apt-get remove -y "$name" 2>&1 | sed 's/^/    /' || true ;;
+    dnf) run_sudo dnf remove -y "$name" 2>&1 | sed 's/^/    /' || true ;;
+    npm_global) (run_sudo npm uninstall -g "$name" 2>&1 || npm uninstall -g "$name" 2>&1) | sed 's/^/    /' || true ;;
     *) warn "  Unknown manager '$mgr' for $name — remove it yourself." ;;
   esac
 }
@@ -824,8 +1058,7 @@ _yubikey_pkcs11_path() {
   case "$OS_KERNEL" in
     Darwin)
       if ! brew list --formula yubico-piv-tool >/dev/null 2>&1; then
-        log "Installing yubico-piv-tool (provides libykcs11, the PKCS#11 module SSH needs for the YubiKey)"
-        HOMEBREW_NO_AUTO_UPDATE=1 brew install yubico-piv-tool || return 0
+        run_quiet "installing yubico-piv-tool (provides libykcs11 for the YubiKey)" env HOMEBREW_NO_AUTO_UPDATE=1 brew install yubico-piv-tool || return 0
       fi
       local prefix
       prefix="$(brew --prefix yubico-piv-tool 2>/dev/null)"
