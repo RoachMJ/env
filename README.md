@@ -12,8 +12,6 @@
 
 # Environment Configuration
 
-**Author:** [Mike Roach](https://github.com/RoachMJ)
-
 > **TL;DR** — This bootstrap repo is public and holds no secrets. It's purpose is for deploying specific profiles for development envioronments via one of two auth paths, then hands off to that profile's own installer. `curl -fsSL <raw-url>/install.sh | bash` on a brand-new machine, everything lands under ~/.env-config — a plain folder, not a git repo itself, holding three independent clones (this repo lands in its env/ subfolder, env-personal/ and env-professional/ alongside it).
 
 <details>
