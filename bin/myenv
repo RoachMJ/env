@@ -15,9 +15,13 @@
 # Subcommands:
 #   myenv status    read-only: branch, last commit, version state for
 #                   every repo (fetches first, never writes/merges)
-#   myenv update    fetch, then interactively offer to integrate
-#                   whatever's new — new branches, new commits on the
-#                   current branch, new tags — one repo at a time
+#   myenv update [branch]
+#                   fetch, then interactively offer to integrate
+#                   whatever's new — new branches, new commits on ANY
+#                   local branch that has an upstream (not just
+#                   whichever one's checked out), new tags — one repo
+#                   at a time. Pass a branch name to only consider that
+#                   one branch across all three repos.
 #   myenv version   one-line version summary per repo (for scripting/
 #                   piping — no color, no prompts)
 #   myenv help      this text
@@ -52,10 +56,14 @@ usage() {
 myenv — status/update CLI for the MyEnv install
 
 Usage:
-  myenv status     show branch/commit/version state for every repo (read-only)
-  myenv update     fetch, then interactively offer to integrate new branches/commits
-  myenv version    one-line version summary per repo (no color, no prompts)
-  myenv help       show this help
+  myenv status         show branch/commit/version state for every repo (read-only)
+  myenv update [branch]
+                       fetch, then interactively offer to integrate new
+                       branches/commits on every local branch that has an
+                       upstream — not just whichever one's checked out.
+                       Pass a branch name to only consider that branch.
+  myenv version        one-line version summary per repo (no color, no prompts)
+  myenv help           show this help
 
 Repos checked (under ENVCFG_HOME, default ~/.env-config):
   env, env-personal, env-professional
@@ -83,6 +91,22 @@ version_state() {
     ahead="$(git -C "$dir" rev-list --count "${last_tag}..HEAD" 2>/dev/null || echo '?')"
     printf 'experimental|%s +%s commit(s)\n' "$last_tag" "$ahead"
   fi
+}
+
+# branches_behind <repo-dir> [only-branch] -> "branch:behind-count" per
+# line, for every local branch that has an upstream and is behind it.
+# If only-branch is given, filters to just that one (if it exists
+# locally with an upstream at all).
+branches_behind() {
+  local dir="$1" only="${2:-}"
+  local b upstream behind
+  while read -r b upstream; do
+    [[ -z "$b" || -z "$upstream" ]] && continue
+    [[ -n "$only" && "$b" != "$only" ]] && continue
+    behind="$(git -C "$dir" rev-list --count "${b}..${upstream}" 2>/dev/null || echo 0)"
+    (( behind > 0 )) && printf '%s:%s\n' "$b" "$behind"
+  done < <(git -C "$dir" for-each-ref --format='%(refname:short) %(upstream:short)' refs/heads)
+  return 0
 }
 
 # new_remote_branches <repo-dir> <current-branch> -> one branch name per
@@ -172,6 +196,7 @@ cmd_version() {
 }
 
 cmd_update() {
+  local only_branch="${1:-}"
   for repo in "${REPOS[@]}"; do
     local dir branch
     dir="$(repo_dir "$repo")"
@@ -184,77 +209,118 @@ cmd_update() {
     git -C "$dir" fetch --quiet 2>/dev/null || { warn "  fetch failed — skipping"; continue; }
     branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 
-    # new remote branches -> offer to check one out
-    local -a new_branches
-    mapfile -t new_branches < <(new_remote_branches "$dir" "$branch")
-    if (( ${#new_branches[@]} > 0 )); then
-      say "  ${c_red}New branch(es) on origin:${c_reset}"
-      local i=1
-      for b in "${new_branches[@]}"; do
-        say "    [$i] $b"
-        i=$((i + 1))
-      done
-      if [[ -t 0 ]]; then
-        read -r -p "  Check one out locally? (number, or Enter to skip) " reply
-        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#new_branches[@]} )); then
-          local chosen="${new_branches[$((reply - 1))]}"
-          if git -C "$dir" checkout -b "$chosen" "origin/$chosen" 2>&1; then
-            say "  ${c_green}Checked out $chosen${c_reset}"
-          else
-            warn "  Couldn't check out $chosen — see output above."
-          fi
-        fi
-      else
-        say "  ${c_dim}(no TTY — skipping the checkout prompt)${c_reset}"
-      fi
-    fi
-
-    # new commits on the current branch's upstream -> show + offer to pull
-    if git -C "$dir" rev-parse --verify -q "origin/$branch" >/dev/null 2>&1; then
-      local behind_local
-      behind_local="$(git -C "$dir" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo 0)"
-      if (( behind_local > 0 )); then
-        say "  ${c_amber}${behind_local} new commit(s) on origin/${branch}:${c_reset}"
-        git -C "$dir" log --oneline "HEAD..origin/$branch" | sed 's/^/    /'
-
-        # latest tag reachable from the NEW upstream tip, with its notes,
-        # if it's newer than what's already checked out locally
-        local upstream_tag current_tag
-        upstream_tag="$(git -C "$dir" describe --tags --abbrev=0 "origin/$branch" 2>/dev/null || true)"
-        current_tag="$(git -C "$dir" describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
-        if [[ -n "$upstream_tag" && "$upstream_tag" != "$current_tag" ]]; then
-          say ""
-          say "  ${c_bold}${upstream_tag} release notes:${c_reset}"
-          git -C "$dir" tag -l -n99 "$upstream_tag" | sed '1s/^[^ ]*[ ]*//' | sed 's/^/    /'
-          say ""
-        fi
-
+    # new remote branches entirely absent locally -> offer to check one out.
+    # Skipped when a specific --only branch was requested — that's for
+    # updating a branch you already have, not discovering new ones.
+    if [[ -z "$only_branch" ]]; then
+      local -a new_branches
+      mapfile -t new_branches < <(new_remote_branches "$dir" "$branch")
+      if (( ${#new_branches[@]} > 0 )); then
+        say "  ${c_red}New branch(es) on origin:${c_reset}"
+        local i=1
+        for b in "${new_branches[@]}"; do
+          say "    [$i] $b"
+          i=$((i + 1))
+        done
         if [[ -t 0 ]]; then
-          read -r -p "  Integrate these changes now? (fast-forward pull) [y/N] " reply
-          case "$reply" in
-            y | Y)
-              if git -C "$dir" merge --ff-only "origin/$branch" 2>&1; then
-                say "  ${c_green}Updated.${c_reset}"
-              else
-                warn "  Fast-forward failed (local commits diverge?) — resolve manually with git."
-              fi
-              ;;
-            *) say "  ${c_dim}Skipped — nothing changed.${c_reset}" ;;
-          esac
+          read -r -p "  Check one out locally? (number, or Enter to skip) " reply
+          if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#new_branches[@]} )); then
+            local chosen="${new_branches[$((reply - 1))]}"
+            if git -C "$dir" checkout -b "$chosen" "origin/$chosen" 2>&1; then
+              say "  ${c_green}Checked out $chosen${c_reset}"
+            else
+              warn "  Couldn't check out $chosen — see output above."
+            fi
+          fi
         else
-          say "  ${c_dim}(no TTY — skipping the integrate prompt)${c_reset}"
+          say "  ${c_dim}(no TTY — skipping the checkout prompt)${c_reset}"
         fi
-      else
-        say "  ${c_dim}Already up to date with origin/${branch}.${c_reset}"
       fi
     fi
+
+    # Every local branch with an upstream that's ahead — not just HEAD.
+    # A repo can easily have both main and a WIP feature branch with
+    # pending upstream commits at the same time; surface all of them.
+    local -a pending
+    mapfile -t pending < <(branches_behind "$dir" "$only_branch")
+
+    if (( ${#pending[@]} == 0 )); then
+      if [[ -n "$only_branch" ]]; then
+        say "  ${c_dim}No local branch '$only_branch' with pending upstream commits here.${c_reset}"
+      else
+        say "  ${c_dim}Nothing pending.${c_reset}"
+      fi
+      continue
+    fi
+
+    local entry b behind
+    for entry in "${pending[@]}"; do
+      b="${entry%%:*}"
+      behind="${entry##*:}"
+
+      say ""
+      say "  ${c_amber}${b}${c_reset} is ${c_amber}${behind} commit(s)${c_reset} behind origin/${b}:"
+      git -C "$dir" log --oneline "${b}..origin/${b}" | sed 's/^/    /'
+
+      # latest tag reachable from the new upstream tip, if it's newer than
+      # what this branch currently has — mostly relevant for the main/
+      # default branch; a WIP feature branch usually has no new tag, so
+      # this block naturally stays quiet for those.
+      local upstream_tag current_tag
+      upstream_tag="$(git -C "$dir" describe --tags --abbrev=0 "origin/$b" 2>/dev/null || true)"
+      current_tag="$(git -C "$dir" describe --tags --abbrev=0 "$b" 2>/dev/null || true)"
+      if [[ -n "$upstream_tag" && "$upstream_tag" != "$current_tag" ]]; then
+        say ""
+        say "  ${c_bold}${upstream_tag} release notes:${c_reset}"
+        git -C "$dir" tag -l -n99 "$upstream_tag" | sed '1s/^[^ ]*[ ]*//' | sed 's/^/    /'
+        say ""
+      fi
+
+      if [[ ! -t 0 ]]; then
+        say "  ${c_dim}(no TTY — skipping the prompt for $b)${c_reset}"
+        continue
+      fi
+
+      if [[ "$b" == "$branch" ]]; then
+        # Currently checked out: a real integrate. Fast-forward only —
+        # "no changes are made" beyond moving the pointer and updating
+        # the working tree, since ff-only can't create a merge commit.
+        read -r -p "  Integrate changes on $b now? (fast-forward pull) [y/N] " reply
+        case "$reply" in
+          y | Y)
+            if git -C "$dir" merge --ff-only "origin/$b" 2>&1; then
+              say "  ${c_green}Updated $b.${c_reset}"
+            else
+              warn "  Fast-forward failed (local commits diverge?) — resolve manually with git."
+            fi
+            ;;
+          *) say "  ${c_dim}Skipped — $b unchanged.${c_reset}" ;;
+        esac
+      else
+        # Not checked out: just refresh the branch pointer so it's fresh
+        # for testing, without touching your current branch or working
+        # tree. 'git fetch origin b:b' refuses on its own if it wouldn't
+        # be a fast-forward, so this can't silently clobber anything.
+        read -r -p "  Pull $b fresh for testing (won't touch your current branch, $branch)? [y/N] " reply
+        case "$reply" in
+          y | Y)
+            if git -C "$dir" fetch origin "${b}:${b}" 2>&1; then
+              say "  ${c_green}$b refreshed.${c_reset}"
+            else
+              warn "  Couldn't fast-forward $b locally — see output above."
+            fi
+            ;;
+          *) say "  ${c_dim}Skipped — $b unchanged.${c_reset}" ;;
+        esac
+      fi
+    done
   done
   say ""
 }
 
 case "${1:-}" in
   status)  cmd_status ;;
-  update)  cmd_update ;;
+  update)  cmd_update "${2:-}" ;;
   version) cmd_version ;;
   help | --help | -h | "") usage ;;
   *)
