@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------------
+# myenv — status/update CLI for the MyEnv three-repo install
+# (env, env-personal, env-professional, all under ~/.env-config).
+#
+# v1, deliberately plain bash — this is the MVP version of what's
+# meant to eventually become a real Go binary (see the "Go migration"
+# epic in release-planning/issues/005-epic-go-migration.md) once the
+# broader component-registry redesign lands. Until then, this covers
+# the concrete, urgent need it was built for: noticing a new branch or
+# unpulled changes on a repo and asking what to do about it, instead
+# of silently doing nothing (the actual incident that prompted this —
+# see release-planning/issues/010-cli-repo-state-awareness.md).
+#
+# Subcommands:
+#   myenv status    read-only: branch, last commit, version state for
+#                   every repo (fetches first, never writes/merges)
+#   myenv update    fetch, then interactively offer to integrate
+#                   whatever's new — new branches, new commits on the
+#                   current branch, new tags — one repo at a time
+#   myenv version   one-line version summary per repo (for scripting/
+#                   piping — no color, no prompts)
+#   myenv help      this text
+#
+# "Version state": if the current HEAD is exactly a tagged commit,
+# that tag is the version, shown as stable. If HEAD is ahead of the
+# latest tag by any number of commits, that's flagged EXPERIMENTAL —
+# real but not yet released. No tags at all -> "dev".
+# ------------------------------------------------------------------
+set -euo pipefail
+
+ENVCFG_HOME="${ENVCFG_HOME:-$HOME/.env-config}"
+REPOS=(env env-personal env-professional)
+
+# ---- color (real ANSI, same idea as the MyEnv install banner — off
+# automatically when not writing to a terminal, e.g. piped into a file
+# or another command) ----
+if [[ -t 1 ]]; then
+  c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_dim=$'\033[2m'
+  c_green=$'\033[38;2;147;163;95m'; c_amber=$'\033[38;2;217;181;104m'
+  c_red=$'\033[38;2;192;82;58m'; c_blue=$'\033[38;2;91;107;122m'
+else
+  c_reset=""; c_bold=""; c_dim=""; c_green=""; c_amber=""; c_red=""; c_blue=""
+fi
+
+say()    { printf '%s\n' "$*"; }
+header() { printf '\n%s%s%s\n' "$c_bold" "$*" "$c_reset"; }
+warn()   { printf '%s%s%s\n' "$c_amber" "$*" "$c_reset" >&2; }
+
+usage() {
+  cat <<'EOF'
+myenv — status/update CLI for the MyEnv install
+
+Usage:
+  myenv status     show branch/commit/version state for every repo (read-only)
+  myenv update     fetch, then interactively offer to integrate new branches/commits
+  myenv version    one-line version summary per repo (no color, no prompts)
+  myenv help       show this help
+
+Repos checked (under ENVCFG_HOME, default ~/.env-config):
+  env, env-personal, env-professional
+EOF
+}
+
+repo_dir() { printf '%s/%s' "$ENVCFG_HOME" "$1"; }
+
+# version_state <repo-dir> -> prints "LABEL|detail", e.g.
+#   stable|v1.0.0
+#   experimental|v1.0.0 +3 commits
+#   dev|no tags yet
+version_state() {
+  local dir="$1" last_tag tag_commit head_commit ahead
+  last_tag="$(git -C "$dir" describe --tags --abbrev=0 2>/dev/null || true)"
+  if [[ -z "$last_tag" ]]; then
+    printf 'dev|no tags yet\n'
+    return 0
+  fi
+  tag_commit="$(git -C "$dir" rev-list -n1 "$last_tag" 2>/dev/null || true)"
+  head_commit="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$tag_commit" == "$head_commit" ]]; then
+    printf 'stable|%s\n' "$last_tag"
+  else
+    ahead="$(git -C "$dir" rev-list --count "${last_tag}..HEAD" 2>/dev/null || echo '?')"
+    printf 'experimental|%s +%s commit(s)\n' "$last_tag" "$ahead"
+  fi
+}
+
+# new_remote_branches <repo-dir> <current-branch> -> one branch name per
+# line, remote branches with no matching local branch (excludes HEAD/
+# symbolic refs)
+new_remote_branches() {
+  local dir="$1"
+  local -a remote_names local_names
+  mapfile -t remote_names < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/remotes/origin | sed 's#^origin/##' | grep -v '^HEAD$' || true)
+  mapfile -t local_names < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads || true)
+  for r in "${remote_names[@]:-}"; do
+    [[ -z "$r" ]] && continue
+    local found=0
+    for l in "${local_names[@]:-}"; do
+      [[ "$r" == "$l" ]] && { found=1; break; }
+    done
+    (( found == 0 )) && printf '%s\n' "$r"
+  done
+}
+
+print_repo_status() {
+  local repo="$1" dir branch last_commit state label detail
+  dir="$(repo_dir "$repo")"
+  header "== $repo =="
+  if [[ ! -d "$dir/.git" ]]; then
+    say "  ${c_dim}(not cloned — nothing to check)${c_reset}"
+    return 0
+  fi
+
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  last_commit="$(git -C "$dir" log -1 --format='%h %s (%cr)' 2>/dev/null || echo '?')"
+  state="$(version_state "$dir")"
+  label="${state%%|*}"
+  detail="${state#*|}"
+
+  say "  Branch:       $branch"
+  say "  Last commit:  $last_commit"
+  case "$label" in
+    stable)       say "  Version:      ${c_green}${detail} (stable)${c_reset}" ;;
+    experimental) say "  Version:      ${c_amber}${detail} (experimental — untagged)${c_reset}" ;;
+    dev)          say "  Version:      ${c_amber}dev (${detail})${c_reset}" ;;
+  esac
+
+  # ahead/behind vs origin/<branch>, only if that remote branch exists
+  if git -C "$dir" rev-parse --verify -q "origin/$branch" >/dev/null 2>&1; then
+    local ahead_local behind_local
+    ahead_local="$(git -C "$dir" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo 0)"
+    behind_local="$(git -C "$dir" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo 0)"
+    if (( behind_local > 0 )); then
+      say "  Upstream:     ${c_amber}${behind_local} new commit(s) on origin/${branch} not pulled yet${c_reset}"
+    fi
+    if (( ahead_local > 0 )); then
+      say "  Upstream:     ${c_dim}${ahead_local} local commit(s) not pushed yet${c_reset}"
+    fi
+  fi
+
+  local -a new_branches
+  mapfile -t new_branches < <(new_remote_branches "$dir" "$branch")
+  if (( ${#new_branches[@]} > 0 )); then
+    say "  ${c_red}New branch(es) on origin not seen locally:${c_reset}"
+    for b in "${new_branches[@]}"; do
+      say "    - $b"
+    done
+  fi
+}
+
+cmd_status() {
+  for repo in "${REPOS[@]}"; do
+    local dir; dir="$(repo_dir "$repo")"
+    [[ -d "$dir/.git" ]] && git -C "$dir" fetch --quiet 2>/dev/null || true
+    print_repo_status "$repo"
+  done
+  say ""
+}
+
+cmd_version() {
+  for repo in "${REPOS[@]}"; do
+    local dir state
+    dir="$(repo_dir "$repo")"
+    if [[ ! -d "$dir/.git" ]]; then
+      printf '%s: not cloned\n' "$repo"
+      continue
+    fi
+    state="$(version_state "$dir")"
+    printf '%s: %s\n' "$repo" "${state#*|}"
+  done
+}
+
+cmd_update() {
+  for repo in "${REPOS[@]}"; do
+    local dir branch
+    dir="$(repo_dir "$repo")"
+    header "== $repo =="
+    if [[ ! -d "$dir/.git" ]]; then
+      say "  ${c_dim}(not cloned — skipping)${c_reset}"
+      continue
+    fi
+
+    git -C "$dir" fetch --quiet 2>/dev/null || { warn "  fetch failed — skipping"; continue; }
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+
+    # new remote branches -> offer to check one out
+    local -a new_branches
+    mapfile -t new_branches < <(new_remote_branches "$dir" "$branch")
+    if (( ${#new_branches[@]} > 0 )); then
+      say "  ${c_red}New branch(es) on origin:${c_reset}"
+      local i=1
+      for b in "${new_branches[@]}"; do
+        say "    [$i] $b"
+        i=$((i + 1))
+      done
+      if [[ -t 0 ]]; then
+        read -r -p "  Check one out locally? (number, or Enter to skip) " reply
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#new_branches[@]} )); then
+          local chosen="${new_branches[$((reply - 1))]}"
+          if git -C "$dir" checkout -b "$chosen" "origin/$chosen" 2>&1; then
+            say "  ${c_green}Checked out $chosen${c_reset}"
+          else
+            warn "  Couldn't check out $chosen — see output above."
+          fi
+        fi
+      else
+        say "  ${c_dim}(no TTY — skipping the checkout prompt)${c_reset}"
+      fi
+    fi
+
+    # new commits on the current branch's upstream -> show + offer to pull
+    if git -C "$dir" rev-parse --verify -q "origin/$branch" >/dev/null 2>&1; then
+      local behind_local
+      behind_local="$(git -C "$dir" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo 0)"
+      if (( behind_local > 0 )); then
+        say "  ${c_amber}${behind_local} new commit(s) on origin/${branch}:${c_reset}"
+        git -C "$dir" log --oneline "HEAD..origin/$branch" | sed 's/^/    /'
+
+        # latest tag reachable from the NEW upstream tip, with its notes,
+        # if it's newer than what's already checked out locally
+        local upstream_tag current_tag
+        upstream_tag="$(git -C "$dir" describe --tags --abbrev=0 "origin/$branch" 2>/dev/null || true)"
+        current_tag="$(git -C "$dir" describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
+        if [[ -n "$upstream_tag" && "$upstream_tag" != "$current_tag" ]]; then
+          say ""
+          say "  ${c_bold}${upstream_tag} release notes:${c_reset}"
+          git -C "$dir" tag -l -n99 "$upstream_tag" | sed '1s/^[^ ]*[ ]*//' | sed 's/^/    /'
+          say ""
+        fi
+
+        if [[ -t 0 ]]; then
+          read -r -p "  Integrate these changes now? (fast-forward pull) [y/N] " reply
+          case "$reply" in
+            y | Y)
+              if git -C "$dir" merge --ff-only "origin/$branch" 2>&1; then
+                say "  ${c_green}Updated.${c_reset}"
+              else
+                warn "  Fast-forward failed (local commits diverge?) — resolve manually with git."
+              fi
+              ;;
+            *) say "  ${c_dim}Skipped — nothing changed.${c_reset}" ;;
+          esac
+        else
+          say "  ${c_dim}(no TTY — skipping the integrate prompt)${c_reset}"
+        fi
+      else
+        say "  ${c_dim}Already up to date with origin/${branch}.${c_reset}"
+      fi
+    fi
+  done
+  say ""
+}
+
+case "${1:-}" in
+  status)  cmd_status ;;
+  update)  cmd_update ;;
+  version) cmd_version ;;
+  help | --help | -h | "") usage ;;
+  *)
+    echo "Unknown subcommand: $1" >&2
+    usage
+    exit 1
+    ;;
+esac

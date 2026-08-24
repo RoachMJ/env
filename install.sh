@@ -528,5 +528,10 @@ for p in "${PROFILES[@]}"; do
   fi
 done
 
+mkdir -p "$HOME/bin"
+chmod +x "$SCRIPT_DIR/bin/myenv"
+link_file "$SCRIPT_DIR/bin/myenv" "$HOME/bin/myenv"
+log "Installed 'myenv' CLI -> $HOME/bin/myenv (status/update/version — see 'myenv help')"
+
 print_next_steps
 log "Done."
