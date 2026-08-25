@@ -16,14 +16,24 @@
 #   myenv status    read-only: branch, last commit, version state for
 #                   every repo (fetches first, never writes/merges)
 #   myenv update [branch]
-#                   fetch, then interactively offer to integrate
-#                   whatever's new — new branches, new commits on ANY
-#                   local branch that has an upstream (not just
-#                   whichever one's checked out), new tags — one repo
-#                   at a time. Pass a branch name to only consider that
-#                   one branch across all three repos.
+#                   fetch every repo, show ONLY what's new (new branches,
+#                   branch/tag updates on ANY local branch with an
+#                   upstream — not just whichever one's checked out), then
+#                   one menu: update everything, or pick per repo. Nothing
+#                   new -> says so, no prompts. Pass a branch name to
+#                   scope to just that branch across all three repos.
 #   myenv version   one-line version summary per repo (for scripting/
 #                   piping — no color, no prompts)
+#   myenv link      re-run each profile's own install.sh --all, non-
+#                   interactively — picks up any NEW symlink/config-sync
+#                   calls a `git pull`/branch checkout brought in (e.g. a
+#                   new codex/rules/ dir) without re-walking every package
+#                   install prompt. Safe to run any time: install.sh's own
+#                   package checks already skip fast when something's
+#                   already installed, and link_file/sync_config_overlay
+#                   are idempotent no-ops when nothing changed. Does not
+#                   touch the env bootstrap repo — its one symlink
+#                   (bin/myenv) is already in place if you're running this.
 #   myenv help      this text
 #
 # "Version state": if the current HEAD is exactly a tagged commit,
@@ -58,11 +68,20 @@ myenv — status/update CLI for the MyEnv install
 Usage:
   myenv status         show branch/commit/version state for every repo (read-only)
   myenv update [branch]
-                       fetch, then interactively offer to integrate new
-                       branches/commits on every local branch that has an
-                       upstream — not just whichever one's checked out.
-                       Pass a branch name to only consider that branch.
+                       fetch every repo, then show ONLY what's actually new:
+                       new branches on origin, and local branches (any of
+                       them, not just whichever one's checked out) whose
+                       upstream has commits/tags they don't have yet. If
+                       nothing's new, says so and exits — no prompts.
+                       Otherwise asks once: update everything found, or go
+                       repo-by-repo and pick exactly what to do per repo
+                       (Enter always means "leave this repo alone").
+                       Pass a branch name to scope everything to just that
+                       one branch across all repos.
   myenv version        one-line version summary per repo (no color, no prompts)
+  myenv link           re-sync symlinks/configs (re-runs each profile's
+                       install.sh --all, non-interactive) — use after a
+                       git pull/checkout brings in a new symlinked file
   myenv help           show this help
 
 Repos checked (under ENVCFG_HOME, default ~/.env-config):
@@ -171,9 +190,9 @@ new_remote_branches() {
   local dir="$1"
   local -a remote_names local_names
   _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/remotes/origin | sed 's#^origin/##' | grep -v '^HEAD$' || true)
-  remote_names=("${_read_lines_result[@]}")
+  remote_names=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
   _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads || true)
-  local_names=("${_read_lines_result[@]}")
+  local_names=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
   for r in "${remote_names[@]:-}"; do
     [[ -z "$r" ]] && continue
     local found=0
@@ -220,7 +239,7 @@ print_repo_status() {
 
   local -a new_branches
   _read_lines < <(new_remote_branches "$dir" "$branch")
-  new_branches=("${_read_lines_result[@]}")
+  new_branches=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
   if (( ${#new_branches[@]} > 0 )); then
     say "  ${c_red}New branch(es) on origin not seen locally:${c_reset}"
     for b in "${new_branches[@]}"; do
@@ -249,124 +268,213 @@ cmd_version() {
   done
 }
 
+# Re-sync symlinks/configs without a full interactive install. Runs each
+# PROFILE repo's own install.sh --all — non-interactive (--all skips the
+# checklist prompt entirely), and safe to run any time: install_pkg_one
+# already checks whether a package is installed before doing anything
+# (fast no-op the vast majority of runs), and link_file/sync_config_overlay
+# are themselves idempotent no-ops when the symlink/generated file already
+# matches. What this actually buys you: any NEW link_file/sync_config_overlay
+# call that landed in install.sh via a git pull/branch checkout (a new
+# codex/rules/ dir, say) takes effect immediately, without walking through
+# every package-install prompt to get there.
+#
+# Deliberately skips the "env" bootstrap repo — it has no ITEM_KEYS/--all
+# checklist of its own (see env/install.sh's own usage text), and its one
+# symlink (bin/myenv) is already in place if this command is running at
+# all, since myenv only exists on $PATH once install.sh has put it there.
+cmd_link() {
+  _require_repos || return 1
+  local repo dir ran=0
+  for repo in "${REPOS[@]}"; do
+    [[ "$repo" == "env" ]] && continue
+    dir="$(repo_dir "$repo")"
+    if [[ ! -f "$dir/install.sh" ]]; then
+      warn "  ${repo}: no install.sh found — skipping"
+      continue
+    fi
+    header "== $repo =="
+    if ( cd "$dir" && bash install.sh --all ); then
+      say "  ${c_green}Re-synced.${c_reset}"
+    else
+      warn "  install.sh --all exited non-zero for $repo — see output above."
+    fi
+    ran=1
+  done
+  if (( ran == 0 )); then
+    say "Nothing to link — no profile repos (env-personal/env-professional) found under $ENVCFG_HOME."
+  fi
+  say ""
+}
+
+# repo_update_options <dir> <branch> [only-branch] -> one option per line,
+# "TYPE|TARGET|LABEL" (pipe-delimited — TARGET is a plain branch name,
+# never contains a pipe, so this is safe to split on). TYPE is
+# "newbranch" (on origin, no local branch yet) or "pending" (a local
+# branch, current or not, whose upstream has commits it doesn't have
+# yet). This is the ONLY thing cmd_update below shows or acts on —
+# deliberately just these three kinds of real state (new branches, new
+# tags — folded into a pending branch's label when relevant — and
+# branch updates), nothing invented or phrased as a generic "sync to
+# origin" action.
+repo_update_options() {
+  local dir="$1" branch="$2" only="${3:-}"
+
+  if [[ -z "$only" ]]; then
+    local -a new_list=()
+    _read_lines < <(new_remote_branches "$dir" "$branch")
+    new_list=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
+    local nb
+    for nb in "${new_list[@]}"; do
+      printf 'newbranch|%s|new branch on origin, not checked out locally\n' "$nb"
+    done
+  fi
+
+  local -a pend=()
+  _read_lines < <(branches_behind "$dir" "$only")
+  pend=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
+  local entry b behind upstream_tag current_tag label
+  for entry in "${pend[@]}"; do
+    b="${entry%%:*}"
+    behind="${entry##*:}"
+    upstream_tag="$(git -C "$dir" describe --tags --abbrev=0 "origin/$b" 2>/dev/null || true)"
+    current_tag="$(git -C "$dir" describe --tags --abbrev=0 "$b" 2>/dev/null || true)"
+    label="${behind} commit(s) behind origin/${b}"
+    [[ -n "$upstream_tag" && "$upstream_tag" != "$current_tag" ]] && label="$label, includes new tag $upstream_tag"
+    printf 'pending|%s|%s\n' "$b" "$label"
+  done
+}
+
+# _apply_update <dir> <current-branch> <target-branch> — the only two
+# actions this CLI ever takes on a repo: fast-forward the branch you're
+# already on (git merge --ff-only, refuses on its own if it wouldn't be
+# a clean fast-forward — can't silently clobber anything), or refresh a
+# DIFFERENT local branch's pointer for testing without touching your
+# current branch/working tree (git fetch origin b:b — same ff-only
+# safety, just via fetch instead of merge since there's no working tree
+# to update).
+_apply_update() {
+  local dir="$1" branch="$2" target="$3"
+  if [[ "$target" == "$branch" ]]; then
+    if git -C "$dir" merge --ff-only "origin/$target" 2>&1; then
+      say "  ${c_green}Updated $target.${c_reset}"
+    else
+      warn "  Fast-forward failed on $target (local commits diverge?) — resolve manually with git."
+    fi
+  else
+    if git -C "$dir" fetch origin "${target}:${target}" 2>&1; then
+      say "  ${c_green}$target refreshed (won't touch your current branch, $branch).${c_reset}"
+    else
+      warn "  Couldn't fast-forward $target locally — see output above."
+    fi
+  fi
+}
+
 cmd_update() {
   _require_repos || return 1
   local only_branch="${1:-}"
+
+  # Pass 1: fetch every repo, see who actually has anything (no prompts
+  # yet) — this is what makes the top-level "update all / select
+  # individually" menu possible: it only asks that question once we
+  # already know which repos have real updates.
+  local -a repos_with_updates=()
   for repo in "${REPOS[@]}"; do
     local dir branch
     dir="$(repo_dir "$repo")"
-    header "== $repo =="
-
-    git -C "$dir" fetch --quiet 2>/dev/null || { warn "  fetch failed — skipping"; continue; }
-    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-
-    # new remote branches entirely absent locally -> offer to check one out.
-    # Skipped when a specific --only branch was requested — that's for
-    # updating a branch you already have, not discovering new ones.
-    if [[ -z "$only_branch" ]]; then
-      local -a new_branches
-      _read_lines < <(new_remote_branches "$dir" "$branch")
-      new_branches=("${_read_lines_result[@]}")
-      if (( ${#new_branches[@]} > 0 )); then
-        say "  ${c_red}New branch(es) on origin:${c_reset}"
-        local i=1
-        for b in "${new_branches[@]}"; do
-          say "    [$i] $b"
-          i=$((i + 1))
-        done
-        if [[ -t 0 ]]; then
-          read -r -p "  Check one out locally? (number, or Enter to skip) " reply
-          if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#new_branches[@]} )); then
-            local chosen="${new_branches[$((reply - 1))]}"
-            if git -C "$dir" checkout -b "$chosen" "origin/$chosen" 2>&1; then
-              say "  ${c_green}Checked out $chosen${c_reset}"
-            else
-              warn "  Couldn't check out $chosen — see output above."
-            fi
-          fi
-        else
-          say "  ${c_dim}(no TTY — skipping the checkout prompt)${c_reset}"
-        fi
-      fi
-    fi
-
-    # Every local branch with an upstream that's ahead — not just HEAD.
-    # A repo can easily have both main and a WIP feature branch with
-    # pending upstream commits at the same time; surface all of them.
-    local -a pending
-    _read_lines < <(branches_behind "$dir" "$only_branch")
-    pending=("${_read_lines_result[@]}")
-
-    if (( ${#pending[@]} == 0 )); then
-      if [[ -n "$only_branch" ]]; then
-        say "  ${c_dim}No local branch '$only_branch' with pending upstream commits here.${c_reset}"
-      else
-        say "  ${c_dim}Nothing pending.${c_reset}"
-      fi
+    if ! git -C "$dir" fetch --quiet 2>/dev/null; then
+      warn "  ${repo}: fetch failed — skipping"
       continue
     fi
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    local -a opts=()
+    _read_lines < <(repo_update_options "$dir" "$branch" "$only_branch")
+    opts=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
+    (( ${#opts[@]} > 0 )) && repos_with_updates+=("$repo")
+  done
 
-    local entry b behind
-    for entry in "${pending[@]}"; do
-      b="${entry%%:*}"
-      behind="${entry##*:}"
+  if (( ${#repos_with_updates[@]} == 0 )); then
+    if [[ -n "$only_branch" ]]; then
+      say "Nothing pending for '$only_branch' on any repo."
+    else
+      say "Everything up to date."
+    fi
+    return 0
+  fi
 
-      say ""
-      say "  ${c_amber}${b}${c_reset} is ${c_amber}${behind} commit(s)${c_reset} behind origin/${b}:"
-      git -C "$dir" log --oneline "${b}..origin/${b}" | sed 's/^/    /'
+  # Top-level menu — skipped entirely when a specific branch was
+  # requested (already scoped) or there's no TTY to ask on (falls back
+  # to a read-only listing so this stays script/pipe-safe).
+  local mode="select"
+  if [[ -z "$only_branch" && -t 0 ]]; then
+    say ""
+    say "${c_bold}I see updates on: ${repos_with_updates[*]}${c_reset}"
+    say "  1) Update all to latest branch/tag"
+    say "  2) Select each repo individually"
+    read -r -p "Choice [1/2]: " top_choice
+    [[ "$top_choice" == "1" ]] && mode="all"
+  elif [[ ! -t 0 ]]; then
+    say "${c_dim}(no TTY — listing only, nothing applied)${c_reset}"
+    mode="list"
+  fi
 
-      # latest tag reachable from the new upstream tip, if it's newer than
-      # what this branch currently has — mostly relevant for the main/
-      # default branch; a WIP feature branch usually has no new tag, so
-      # this block naturally stays quiet for those.
-      local upstream_tag current_tag
-      upstream_tag="$(git -C "$dir" describe --tags --abbrev=0 "origin/$b" 2>/dev/null || true)"
-      current_tag="$(git -C "$dir" describe --tags --abbrev=0 "$b" 2>/dev/null || true)"
-      if [[ -n "$upstream_tag" && "$upstream_tag" != "$current_tag" ]]; then
-        say ""
-        say "  ${c_bold}${upstream_tag} release notes:${c_reset}"
-        git -C "$dir" tag -l -n99 "$upstream_tag" | sed '1s/^[^ ]*[ ]*//' | sed 's/^/    /'
-        say ""
-      fi
+  for repo in "${repos_with_updates[@]}"; do
+    local dir branch
+    dir="$(repo_dir "$repo")"
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    header "== $repo =="
+    say "  Current: $branch"
 
-      if [[ ! -t 0 ]]; then
-        say "  ${c_dim}(no TTY — skipping the prompt for $b)${c_reset}"
-        continue
-      fi
+    local -a opts=()
+    _read_lines < <(repo_update_options "$dir" "$branch" "$only_branch")
+    opts=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
 
-      if [[ "$b" == "$branch" ]]; then
-        # Currently checked out: a real integrate. Fast-forward only —
-        # "no changes are made" beyond moving the pointer and updating
-        # the working tree, since ff-only can't create a merge commit.
-        read -r -p "  Integrate changes on $b now? (fast-forward pull) [y/N] " reply
-        case "$reply" in
-          y | Y)
-            if git -C "$dir" merge --ff-only "origin/$b" 2>&1; then
-              say "  ${c_green}Updated $b.${c_reset}"
-            else
-              warn "  Fast-forward failed (local commits diverge?) — resolve manually with git."
-            fi
-            ;;
-          *) say "  ${c_dim}Skipped — $b unchanged.${c_reset}" ;;
-        esac
-      else
-        # Not checked out: just refresh the branch pointer so it's fresh
-        # for testing, without touching your current branch or working
-        # tree. 'git fetch origin b:b' refuses on its own if it wouldn't
-        # be a fast-forward, so this can't silently clobber anything.
-        read -r -p "  Pull $b fresh for testing (won't touch your current branch, $branch)? [y/N] " reply
-        case "$reply" in
-          y | Y)
-            if git -C "$dir" fetch origin "${b}:${b}" 2>&1; then
-              say "  ${c_green}$b refreshed.${c_reset}"
-            else
-              warn "  Couldn't fast-forward $b locally — see output above."
-            fi
-            ;;
-          *) say "  ${c_dim}Skipped — $b unchanged.${c_reset}" ;;
-        esac
-      fi
-    done
+    local o type rest target label
+    case "$mode" in
+      list)
+        for o in "${opts[@]}"; do
+          type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
+          say "    - $target: $label"
+        done
+        ;;
+      all)
+        for o in "${opts[@]}"; do
+          type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
+          if [[ "$type" == "pending" ]]; then
+            _apply_update "$dir" "$branch" "$target"
+          else
+            say "  ${c_dim}New branch (not auto-checked-out): $target — $label${c_reset}"
+          fi
+        done
+        ;;
+      select)
+        local i=1
+        local -a menu_type=() menu_target=()
+        for o in "${opts[@]}"; do
+          type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
+          if [[ "$type" == "pending" ]]; then
+            say "    [$i] Update $target — $label"
+          else
+            say "    [$i] Check out $target — $label"
+          fi
+          menu_type+=("$type"); menu_target+=("$target")
+          i=$((i + 1))
+        done
+        read -r -p "  Choice (number, or Enter to stay on $branch): " reply
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#menu_type[@]} )); then
+          local idx=$((reply - 1))
+          if [[ "${menu_type[$idx]}" == "pending" ]]; then
+            _apply_update "$dir" "$branch" "${menu_target[$idx]}"
+          elif git -C "$dir" checkout -b "${menu_target[$idx]}" "origin/${menu_target[$idx]}" 2>&1; then
+            say "  ${c_green}Checked out ${menu_target[$idx]}${c_reset}"
+          else
+            warn "  Couldn't check out ${menu_target[$idx]} — see output above."
+          fi
+        else
+          say "  ${c_dim}Staying on $branch.${c_reset}"
+        fi
+        ;;
+    esac
   done
   say ""
 }
@@ -374,6 +482,7 @@ cmd_update() {
 case "${1:-}" in
   status)  cmd_status ;;
   update)  cmd_update "${2:-}" ;;
+  link)    cmd_link ;;
   version) cmd_version ;;
   help | --help | -h | "") usage ;;
   *)
