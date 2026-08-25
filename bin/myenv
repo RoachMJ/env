@@ -425,13 +425,27 @@ cmd_update() {
 
   # Pass 1: fetch every repo, see who actually has anything (no prompts
   # yet) — nothing is shown or asked until we know which repos have
-  # real updates.
-  local -a repos_with_updates=()
+  # real updates. A fetch failure means that repo was never actually
+  # checked, so it's tracked separately from "checked, nothing new" —
+  # conflating the two into a blanket "up to date" would be lying
+  # about a repo we have zero information on.
+  local -a repos_with_updates=() failed_repos=()
   for repo in "${REPOS[@]}"; do
-    local dir branch
+    local dir branch fetch_err
     dir="$(repo_dir "$repo")"
-    if ! git -C "$dir" fetch --quiet 2>/dev/null; then
+    if ! fetch_err="$(git -C "$dir" fetch --quiet 2>&1)"; then
+      failed_repos+=("$repo")
       warn "  ${repo}: fetch failed — skipping"
+      # Show the real git error instead of swallowing it — this is
+      # almost always SSH auth (wrong/missing key, YubiKey not
+      # touched/PIN not prompted) or no network, and guessing which
+      # wastes more time than just reading git's own message.
+      if [[ -n "$fetch_err" ]]; then
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          warn "    $line"
+        done <<< "$fetch_err"
+      fi
       continue
     fi
     branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
@@ -444,10 +458,15 @@ cmd_update() {
   if (( ${#repos_with_updates[@]} == 0 )); then
     if [[ -n "$only_branch" ]]; then
       say "Nothing pending for '$only_branch' on any repo."
+    elif (( ${#failed_repos[@]} > 0 )); then
+      say "No updates found on the repo(s) that were reachable."
+      warn "Couldn't check: ${failed_repos[*]} (fetch failed — see above)."
     else
       say "Everything up to date."
     fi
     return 0
+  elif (( ${#failed_repos[@]} > 0 )); then
+    warn "Couldn't check: ${failed_repos[*]} (fetch failed — see above)."
   fi
 
   # No top-level "update all / select individually" menu — just walk
