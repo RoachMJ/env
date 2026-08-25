@@ -18,9 +18,12 @@
 #   myenv update [branch]
 #                   fetch every repo, show ONLY what's new (new branches,
 #                   branch/tag updates on ANY local branch with an
-#                   upstream — not just whichever one's checked out), then
-#                   one menu: update everything, or pick per repo. Nothing
-#                   new -> says so, no prompts. Pass a branch name to
+#                   upstream — not just whichever one's checked out).
+#                   Nothing new -> says so, no prompts. Otherwise walks
+#                   repo by repo: states what was found in that repo,
+#                   asks a single y/N ("Enter" = no), and only on yes
+#                   shows the specific branch/tag options to pick from.
+#                   No "update everything" step. Pass a branch name to
 #                   scope to just that branch across all three repos.
 #   myenv version   one-line version summary per repo (for scripting/
 #                   piping — no color, no prompts)
@@ -77,9 +80,11 @@ Usage:
                        them, not just whichever one's checked out) whose
                        upstream has commits/tags they don't have yet. If
                        nothing's new, says so and exits — no prompts.
-                       Otherwise asks once: update everything found, or go
-                       repo-by-repo and pick exactly what to do per repo
-                       (Enter always means "leave this repo alone").
+                       Otherwise walks repo by repo: states what was found
+                       ("Found N new branch(es)/update(s) in <repo>"), asks
+                       a single y/N (Enter = no, skip this repo), and only
+                       on yes shows the specific branch/tag options to pick
+                       from. No "update everything" step.
                        Pass a branch name to scope everything to just that
                        one branch across all repos.
   myenv version        one-line version summary per repo (no color, no prompts)
@@ -169,7 +174,7 @@ branches_behind() {
     [[ -z "$b" || -z "$upstream" ]] && continue
     [[ -n "$only" && "$b" != "$only" ]] && continue
     behind="$(git -C "$dir" rev-list --count "${b}..${upstream}" 2>/dev/null || echo 0)"
-    (( behind > 0 )) && printf '%s:%s\n' "$b" "$behind"
+    if (( behind > 0 )); then printf '%s:%s\n' "$b" "$behind"; fi
   done < <(git -C "$dir" for-each-ref --format='%(refname:short) %(upstream:short)' refs/heads)
   return 0
 }
@@ -223,7 +228,7 @@ new_remote_branches() {
     for l in "${local_names[@]:-}"; do
       [[ "$stripped" == "$l" ]] && { found=1; break; }
     done
-    (( found == 0 )) && printf '%s\n' "$stripped"
+    if (( found == 0 )); then printf '%s\n' "$stripped"; fi
   done
 }
 
@@ -419,9 +424,8 @@ cmd_update() {
   local only_branch="${1:-}"
 
   # Pass 1: fetch every repo, see who actually has anything (no prompts
-  # yet) — this is what makes the top-level "update all / select
-  # individually" menu possible: it only asks that question once we
-  # already know which repos have real updates.
+  # yet) — nothing is shown or asked until we know which repos have
+  # real updates.
   local -a repos_with_updates=()
   for repo in "${REPOS[@]}"; do
     local dir branch
@@ -446,86 +450,104 @@ cmd_update() {
     return 0
   fi
 
-  # Top-level menu — skipped entirely when a specific branch was
-  # requested (already scoped) or there's no TTY to ask on (falls back
-  # to a read-only listing so this stays script/pipe-safe).
-  local mode="select"
-  if [[ -z "$only_branch" && -t 0 ]]; then
-    say ""
-    say "${c_bold}I see updates on: ${repos_with_updates[*]}${c_reset}"
-    say "  1) Update all to latest branch/tag"
-    say "  2) Select each repo individually"
-    read -r -p "Choice [1/2]: " top_choice
-    [[ "$top_choice" == "1" ]] && mode="all"
-  elif [[ ! -t 0 ]]; then
-    say "${c_dim}(no TTY — listing only, nothing applied)${c_reset}"
-    mode="list"
-  fi
+  # No top-level "update all / select individually" menu — just walk
+  # each repo that has updates, one at a time: say what was found,
+  # ask a single yes/no, and only then show the specific branch/tag
+  # options to pick from. No TTY -> read-only listing, script-safe.
+  local no_tty=0
+  [[ ! -t 0 ]] && no_tty=1
+  if (( no_tty )); then say "${c_dim}(no TTY — listing only, nothing applied)${c_reset}"; fi
 
   for repo in "${repos_with_updates[@]}"; do
     local dir branch
     dir="$(repo_dir "$repo")"
     branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-    header "== $repo =="
-    say "  Current: $branch"
 
     local -a opts=()
     _read_lines < <(repo_update_options "$dir" "$branch" "$only_branch")
     opts=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
 
-    local o type rest target label
-    case "$mode" in
-      list)
-        for o in "${opts[@]:-}"; do
-          [[ -z "$o" ]] && continue
-          type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
-          if [[ "$type" == "pending" ]]; then
-            say "    - $target: $label"
-          else
-            say "    - $label"
-          fi
-        done
-        ;;
-      all)
-        for o in "${opts[@]:-}"; do
-          [[ -z "$o" ]] && continue
-          type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
-          if [[ "$type" == "pending" ]]; then
-            _apply_update "$dir" "$branch" "$target"
-          else
-            say "  ${c_dim}$label (not auto-checked-out)${c_reset}"
-          fi
-        done
-        ;;
-      select)
-        local i=1
-        local -a menu_type=() menu_target=()
-        for o in "${opts[@]:-}"; do
-          [[ -z "$o" ]] && continue
-          type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
-          if [[ "$type" == "pending" ]]; then
-            say "    [$i] Update $target — $label"
-          else
-            say "    [$i] $label"
-          fi
-          menu_type+=("$type"); menu_target+=("$target")
-          i=$((i + 1))
-        done
-        read -r -p "  Choice (number, or Enter to stay on $branch): " reply
-        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#menu_type[@]} )); then
-          local idx=$((reply - 1))
-          if [[ "${menu_type[$idx]}" == "pending" ]]; then
-            _apply_update "$dir" "$branch" "${menu_target[$idx]}"
-          elif git -C "$dir" checkout -b "${menu_target[$idx]}" "origin/${menu_target[$idx]}" 2>&1; then
-            say "  ${c_green}Checked out ${menu_target[$idx]}${c_reset}"
-          else
-            warn "  Couldn't check out ${menu_target[$idx]} — see output above."
-          fi
+    local n_new=0 n_pending=0 has_tag=0
+    local o type
+    for o in "${opts[@]:-}"; do
+      [[ -z "$o" ]] && continue
+      type="${o%%|*}"
+      case "$type" in
+        newbranch) n_new=$((n_new + 1)) ;;
+        pending)
+          n_pending=$((n_pending + 1))
+          [[ "$o" == *"includes new tag"* ]] && has_tag=1
+          ;;
+      esac
+    done
+
+    local -a found_bits=()
+    if (( n_new > 0 )); then
+      found_bits+=("${n_new} new branch$([[ $n_new -ne 1 ]] && echo es || true)")
+    fi
+    if (( n_pending > 0 )); then
+      found_bits+=("${n_pending} branch update$([[ $n_pending -ne 1 ]] && echo s || true)")
+    fi
+    if (( has_tag )); then
+      found_bits+=("a new tag")
+    fi
+    local found_str
+    found_str="$(IFS=,; echo "${found_bits[*]:-}")"
+    found_str="${found_str//,/, }"
+
+    header "== $repo =="
+    say "  Current: $branch"
+    say "  Found ${found_str} in ${repo}."
+
+    if (( no_tty )); then
+      local rest target label
+      for o in "${opts[@]:-}"; do
+        [[ -z "$o" ]] && continue
+        type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
+        if [[ "$type" == "pending" ]]; then
+          say "    - $target: $label"
         else
-          say "  ${c_dim}Staying on $branch.${c_reset}"
+          say "    - $label"
         fi
+      done
+      continue
+    fi
+
+    read -r -p "  Update current branch/tag? [y/N] " reply
+    case "$reply" in
+      y | Y) : ;;
+      *)
+        say "  ${c_dim}Skipped.${c_reset}"
+        continue
         ;;
     esac
+
+    local i=1 rest target label
+    local -a menu_type=() menu_target=()
+    for o in "${opts[@]:-}"; do
+      [[ -z "$o" ]] && continue
+      type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
+      if [[ "$type" == "pending" ]]; then
+        say "    [$i] Update $target — $label"
+      else
+        say "    [$i] $label"
+      fi
+      menu_type+=("$type"); menu_target+=("$target")
+      i=$((i + 1))
+    done
+    read -r -p "  Choice (number, or Enter to skip): " reply2
+    if [[ "$reply2" =~ ^[0-9]+$ ]] && (( reply2 >= 1 && reply2 <= ${#menu_type[@]} )); then
+      local idx=$((reply2 - 1))
+      if [[ "${menu_type[$idx]}" == "pending" ]]; then
+        _apply_update "$dir" "$branch" "${menu_target[$idx]}"
+      elif git -C "$dir" checkout -b "${menu_target[$idx]}" "origin/${menu_target[$idx]}" 2>&1; then
+        say "  ${c_green}Checked out ${menu_target[$idx]}${c_reset}"
+      else
+        warn "  Couldn't check out ${menu_target[$idx]} — see output above."
+      fi
+    else
+      say "  ${c_dim}Skipped.${c_reset}"
+    fi
   done
   say ""
 }
