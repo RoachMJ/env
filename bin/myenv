@@ -350,8 +350,9 @@ repo_update_options() {
     _read_lines < <(new_remote_branches "$dir" "$branch")
     new_list=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
     local nb
-    for nb in "${new_list[@]}"; do
-      printf 'newbranch|%s|new branch on origin, not checked out locally\n' "$nb"
+    for nb in "${new_list[@]:-}"; do
+      [[ -z "$nb" ]] && continue
+      printf 'newbranch|%s|NEW - experimental - %s\n' "$nb" "$nb"
     done
   fi
 
@@ -359,7 +360,8 @@ repo_update_options() {
   _read_lines < <(branches_behind "$dir" "$only")
   pend=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
   local entry b behind upstream_tag current_tag label
-  for entry in "${pend[@]}"; do
+  for entry in "${pend[@]:-}"; do
+    [[ -z "$entry" ]] && continue
     b="${entry%%:*}"
     behind="${entry##*:}"
     upstream_tag="$(git -C "$dir" describe --tags --abbrev=0 "origin/$b" 2>/dev/null || true)"
@@ -457,30 +459,37 @@ cmd_update() {
     local o type rest target label
     case "$mode" in
       list)
-        for o in "${opts[@]}"; do
+        for o in "${opts[@]:-}"; do
+          [[ -z "$o" ]] && continue
           type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
-          say "    - $target: $label"
+          if [[ "$type" == "pending" ]]; then
+            say "    - $target: $label"
+          else
+            say "    - $label"
+          fi
         done
         ;;
       all)
-        for o in "${opts[@]}"; do
+        for o in "${opts[@]:-}"; do
+          [[ -z "$o" ]] && continue
           type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
           if [[ "$type" == "pending" ]]; then
             _apply_update "$dir" "$branch" "$target"
           else
-            say "  ${c_dim}New branch (not auto-checked-out): $target — $label${c_reset}"
+            say "  ${c_dim}$label (not auto-checked-out)${c_reset}"
           fi
         done
         ;;
       select)
         local i=1
         local -a menu_type=() menu_target=()
-        for o in "${opts[@]}"; do
+        for o in "${opts[@]:-}"; do
+          [[ -z "$o" ]] && continue
           type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
           if [[ "$type" == "pending" ]]; then
             say "    [$i] Update $target — $label"
           else
-            say "    [$i] Check out $target — $label"
+            say "    [$i] $label"
           fi
           menu_type+=("$type"); menu_target+=("$target")
           i=$((i + 1))
