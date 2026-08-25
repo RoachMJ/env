@@ -72,6 +72,45 @@ EOF
 
 repo_dir() { printf '%s/%s' "$ENVCFG_HOME" "$1"; }
 
+# Filter REPOS down to only what's actually cloned on THIS machine.
+# install.sh lets you install just one profile (env + env-personal only
+# is a completely normal setup — e.g. a personal laptop with no
+# professional profile at all), so unconditionally looping the full
+# env/env-personal/env-professional list and printing a "not cloned"
+# placeholder for whatever wasn't chosen meant every status/update/
+# version run showed that noise forever, on every machine that isn't
+# running all three. Checked once, here, right after repo_dir() is
+# defined (needs it) and before any command runs — every command below
+# just naturally only ever sees repos that exist; no per-command
+# "if not cloned" branch left to keep in sync with this one.
+# Built as a normal array, then reassigned to REPOS with the
+# "${arr[@]+"${arr[@]}"}" form rather than plain "${arr[@]}" — same
+# macOS-bash-3.2 empty-array issue as everywhere else in this script
+# (see the token_args comment in env/install.sh's clone_or_pull_profile
+# for the full explanation): under `set -u`, 3.2 treats a *zero-element*
+# array as unset, so a plain "${_present[@]}" would hard-exit here on
+# any machine with only one profile installed — the exact case this
+# whole filter exists to handle cleanly.
+_present=()
+for _r in "${REPOS[@]}"; do
+  [[ -d "$(repo_dir "$_r")/.git" ]] && _present+=("$_r")
+done
+REPOS=("${_present[@]+"${_present[@]}"}")
+unset _present _r
+
+# Guard for the (rare) case NOTHING was found — misconfigured
+# ENVCFG_HOME, or this got run before any profile's install.sh ever
+# ran. Every cmd_* below calls this first so an empty REPOS produces
+# one clear message instead of a silent no-op loop.
+_require_repos() {
+  if (( ${#REPOS[@]} == 0 )); then
+    echo "myenv: no repos found under $ENVCFG_HOME (looked for: env, env-personal, env-professional)." >&2
+    echo "Run this profile's install.sh first, or check that ENVCFG_HOME is set correctly." >&2
+    return 1
+  fi
+  return 0
+}
+
 # version_state <repo-dir> -> prints "LABEL|detail", e.g.
 #   stable|v1.0.0
 #   experimental|v1.0.0 +3 commits
@@ -149,11 +188,9 @@ print_repo_status() {
   local repo="$1" dir branch last_commit state label detail
   dir="$(repo_dir "$repo")"
   header "== $repo =="
-  if [[ ! -d "$dir/.git" ]]; then
-    say "  ${c_dim}(not cloned — nothing to check)${c_reset}"
-    return 0
-  fi
-
+  # No "not cloned" branch here anymore — $repo only ever comes from the
+  # pre-filtered REPOS (see the top of this file), so $dir/.git is
+  # guaranteed to exist by the time this function runs.
   branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
   last_commit="$(git -C "$dir" log -1 --format='%h %s (%cr)' 2>/dev/null || echo '?')"
   state="$(version_state "$dir")"
@@ -193,37 +230,32 @@ print_repo_status() {
 }
 
 cmd_status() {
+  _require_repos || return 1
   for repo in "${REPOS[@]}"; do
     local dir; dir="$(repo_dir "$repo")"
-    [[ -d "$dir/.git" ]] && git -C "$dir" fetch --quiet 2>/dev/null || true
+    git -C "$dir" fetch --quiet 2>/dev/null || true
     print_repo_status "$repo"
   done
   say ""
 }
 
 cmd_version() {
+  _require_repos || return 1
   for repo in "${REPOS[@]}"; do
     local dir state
     dir="$(repo_dir "$repo")"
-    if [[ ! -d "$dir/.git" ]]; then
-      printf '%s: not cloned\n' "$repo"
-      continue
-    fi
     state="$(version_state "$dir")"
     printf '%s: %s\n' "$repo" "${state#*|}"
   done
 }
 
 cmd_update() {
+  _require_repos || return 1
   local only_branch="${1:-}"
   for repo in "${REPOS[@]}"; do
     local dir branch
     dir="$(repo_dir "$repo")"
     header "== $repo =="
-    if [[ ! -d "$dir/.git" ]]; then
-      say "  ${c_dim}(not cloned — skipping)${c_reset}"
-      continue
-    fi
 
     git -C "$dir" fetch --quiet 2>/dev/null || { warn "  fetch failed — skipping"; continue; }
     branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
