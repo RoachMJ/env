@@ -27,7 +27,7 @@ One git remote = one auth method, so getting "clone the bootstrap repo with zero
 | **env-personal** | per-component subfolders (nvim/, shell/, git-config/, etc.), each with its own README | ENV_PERSONAL_REPO_URL |
 | **env-professional** | same layout, plus meeting-alarm/ and piv/ (PIV-encrypted OPENAI_API_KEY) | ENV_PROFESSIONAL_REPO_URL |
 
-Each repo's own root is exactly its own content — no repo wraps another. `install.sh` clones this bootstrap repo into `~/.env-config/env/`, then shallow-clones whichever profile(s) you pick into `~/.env-config/env-personal/` and/or `~/.env-config/env-professional/` — three independent git clones sitting side by side inside a plain `~/.env-config` folder that is itself never a git repo — then `git pull --ff-only` on later runs, then hands off to that profile's own `install.sh`.
+Each repo's own root is exactly its own content — no repo wraps another. `install.sh` clones this bootstrap repo into `~/.env-config/env/`, then clones whichever profile(s) you pick into `~/.env-config/env-personal/` and/or `~/.env-config/env-professional/` — three independent, full git clones (not shallow — full history and every branch, so `myenv`/`git fetch`/`git checkout <branch>` all just work later) sitting side by side inside a plain `~/.env-config` folder that is itself never a git repo — then `git pull --ff-only` on later runs, then hands off to that profile's own `install.sh`.
 
 Set your real URLs near the top of `install.sh`, replacing the YOUR_GITHUB_USERNAME/REPLACE_ME placeholders — it refuses to run against a placeholder. Or override at runtime: `ENV_PROFESSIONAL_REPO_URL=... ./install.sh`. See "Running it on a brand-new machine" below for the full clone-and-run flow.
 

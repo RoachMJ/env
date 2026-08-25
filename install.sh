@@ -6,7 +6,9 @@
 # Bootstrap script. What it does, in order:
 #   1. Check/offer core packages (git, curl, zsh, starship)
 #   2. Prompt for which profile(s) to install (env-personal/env-professional/both)
-#   3. Shallow-clone (or pull) each chosen profile's own repo
+#   3. Clone (or pull) each chosen profile's own repo — full clone, not
+#      shallow, so branches/tags/history are all there for `myenv` and
+#      normal git work later
 #   4. Hand off to that profile's own install.sh
 #
 # Also supports a one-time setup mode: `./install.sh --encrypt`
@@ -59,7 +61,14 @@ if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]}" ]]; then
   else
     echo "==> Cloning bootstrap repo to $BOOTSTRAP_DIR"
     mkdir -p "$ENVCFG_HOME"
-    git clone --depth 1 "$BOOTSTRAP_REPO_URL" "$BOOTSTRAP_DIR"
+    # Full clone, not --depth 1 — a shallow clone's default single-branch
+    # fetch refspec (+refs/heads/main:refs/remotes/origin/main, not the
+    # +refs/heads/*:refs/remotes/origin/* wildcard) silently hides every
+    # other branch from `git fetch`/`git branch -a` even after the repo
+    # has been cloned, which is invisible until you go looking for a
+    # branch that should be there. Not worth the disk/clone-time savings
+    # for a repo this size.
+    git clone "$BOOTSTRAP_REPO_URL" "$BOOTSTRAP_DIR"
   fi
 
   # Reconnect stdin to the controlling terminal before re-exec'ing.
@@ -307,7 +316,8 @@ case "$profile_choice" in
     ;;
 esac
 
-# 3. Shallow-clone (or pull) each chosen profile's repo — separate
+# 3. Clone (or pull) each chosen profile's repo — full clone, not
+#    shallow (see the bootstrap clone above for why) — separate
 #    repos, not folders in this one. Two places a profile's URL can
 #    come from, checked in this order (see README.md "Repo access"):
 #
@@ -466,7 +476,7 @@ clone_or_pull_profile() {
   fi
 
   if [[ -d "$profile_dir" && -d "$profile_dir/.git" ]]; then
-    log "'$profile' already cloned — pulling latest (shallow)"
+    log "'$profile' already cloned — pulling latest"
     if ! git "${token_args[@]+"${token_args[@]}"}" -C "$profile_dir" pull --ff-only >/tmp/profile_pull.log 2>&1; then
       warn "git pull in $profile_dir failed — continuing with what's already on disk:"
       sed 's/^/    /' /tmp/profile_pull.log
@@ -486,10 +496,10 @@ clone_or_pull_profile() {
     exit 1
   fi
 
-  log "Shallow-cloning '$profile' from:"
+  log "Cloning '$profile' from:"
   log "  $repo_url"
   log "  ($auth_note)"
-  if ! git "${token_args[@]+"${token_args[@]}"}" clone --depth 1 "$repo_url" "$profile_dir"; then
+  if ! git "${token_args[@]+"${token_args[@]}"}" clone "$repo_url" "$profile_dir"; then
     echo "Clone of $repo_url into $profile_dir failed — check the URL and your" >&2
     echo "auth (SSH key loaded / REPO_ACCESS_TOKEN valid) and try again." >&2
     exit 1
