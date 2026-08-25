@@ -109,14 +109,32 @@ branches_behind() {
   return 0
 }
 
+# _read_lines < <(cmd) -> fills _read_lines_result (a plain global, not
+# passed by name). Portable stand-in for `mapfile -t arr < <(cmd)` — macOS
+# ships bash 3.2 as /bin/bash (last GPLv2 release, still the default on
+# every Mac) and 3.2 has neither mapfile (added in bash 4.0) nor nameref
+# variables (declare -n, added in 4.3), so a name-parameterized helper
+# isn't possible here; callers read the fixed-name result array back out
+# instead. Blank lines are dropped so `(( ${#arr[@]} > 0 ))` checks behave
+# the same as they would against a real empty command output.
+_read_lines() {
+  _read_lines_result=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && _read_lines_result+=("$line")
+  done
+}
+
 # new_remote_branches <repo-dir> <current-branch> -> one branch name per
 # line, remote branches with no matching local branch (excludes HEAD/
 # symbolic refs)
 new_remote_branches() {
   local dir="$1"
   local -a remote_names local_names
-  mapfile -t remote_names < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/remotes/origin | sed 's#^origin/##' | grep -v '^HEAD$' || true)
-  mapfile -t local_names < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads || true)
+  _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/remotes/origin | sed 's#^origin/##' | grep -v '^HEAD$' || true)
+  remote_names=("${_read_lines_result[@]}")
+  _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads || true)
+  local_names=("${_read_lines_result[@]}")
   for r in "${remote_names[@]:-}"; do
     [[ -z "$r" ]] && continue
     local found=0
@@ -164,7 +182,8 @@ print_repo_status() {
   fi
 
   local -a new_branches
-  mapfile -t new_branches < <(new_remote_branches "$dir" "$branch")
+  _read_lines < <(new_remote_branches "$dir" "$branch")
+  new_branches=("${_read_lines_result[@]}")
   if (( ${#new_branches[@]} > 0 )); then
     say "  ${c_red}New branch(es) on origin not seen locally:${c_reset}"
     for b in "${new_branches[@]}"; do
@@ -214,7 +233,8 @@ cmd_update() {
     # updating a branch you already have, not discovering new ones.
     if [[ -z "$only_branch" ]]; then
       local -a new_branches
-      mapfile -t new_branches < <(new_remote_branches "$dir" "$branch")
+      _read_lines < <(new_remote_branches "$dir" "$branch")
+      new_branches=("${_read_lines_result[@]}")
       if (( ${#new_branches[@]} > 0 )); then
         say "  ${c_red}New branch(es) on origin:${c_reset}"
         local i=1
@@ -242,7 +262,8 @@ cmd_update() {
     # A repo can easily have both main and a WIP feature branch with
     # pending upstream commits at the same time; surface all of them.
     local -a pending
-    mapfile -t pending < <(branches_behind "$dir" "$only_branch")
+    _read_lines < <(branches_behind "$dir" "$only_branch")
+    pending=("${_read_lines_result[@]}")
 
     if (( ${#pending[@]} == 0 )); then
       if [[ -n "$only_branch" ]]; then
