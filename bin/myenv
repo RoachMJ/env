@@ -24,16 +24,20 @@
 #                   scope to just that branch across all three repos.
 #   myenv version   one-line version summary per repo (for scripting/
 #                   piping — no color, no prompts)
-#   myenv link      re-run each profile's own install.sh --all, non-
-#                   interactively — picks up any NEW symlink/config-sync
-#                   calls a `git pull`/branch checkout brought in (e.g. a
-#                   new codex/rules/ dir) without re-walking every package
-#                   install prompt. Safe to run any time: install.sh's own
-#                   package checks already skip fast when something's
-#                   already installed, and link_file/sync_config_overlay
-#                   are idempotent no-ops when nothing changed. Does not
-#                   touch the env bootstrap repo — its one symlink
-#                   (bin/myenv) is already in place if you're running this.
+#   myenv link      re-sync ONLY what's already installed — reads
+#                   install-manifest.jsonl to find which items a real
+#                   install actually selected per profile, then re-runs
+#                   just those via install.sh --only=<items>. Never
+#                   selects everything, never installs anything new.
+#                   Picks up any NEW symlink/config-sync call a `git
+#                   pull`/branch checkout brought in (e.g. a new
+#                   codex/rules/ dir) for items you already have,
+#                   without re-walking every package install prompt.
+#                   No manifest entries for a profile -> skipped with a
+#                   pointer to run that profile's install.sh yourself
+#                   once. Does not touch the env bootstrap repo — its
+#                   one symlink (bin/myenv) is already in place if
+#                   you're running this.
 #   myenv help      this text
 #
 # "Version state": if the current HEAD is exactly a tagged commit,
@@ -79,9 +83,12 @@ Usage:
                        Pass a branch name to scope everything to just that
                        one branch across all repos.
   myenv version        one-line version summary per repo (no color, no prompts)
-  myenv link           re-sync symlinks/configs (re-runs each profile's
-                       install.sh --all, non-interactive) — use after a
-                       git pull/checkout brings in a new symlinked file
+  myenv link           re-sync ONLY items already installed (reads
+                       install-manifest.jsonl per profile, re-runs just
+                       those via install.sh --only=...) — use after a
+                       git pull/checkout brings in a new symlinked file.
+                       Never selects or installs anything you didn't
+                       already have.
   myenv help           show this help
 
 Repos checked (under ENVCFG_HOME, default ~/.env-config):
@@ -268,24 +275,32 @@ cmd_version() {
   done
 }
 
-# Re-sync symlinks/configs without a full interactive install. Runs each
-# PROFILE repo's own install.sh --all — non-interactive (--all skips the
-# checklist prompt entirely), and safe to run any time: install_pkg_one
-# already checks whether a package is installed before doing anything
-# (fast no-op the vast majority of runs), and link_file/sync_config_overlay
-# are themselves idempotent no-ops when the symlink/generated file already
-# matches. What this actually buys you: any NEW link_file/sync_config_overlay
-# call that landed in install.sh via a git pull/branch checkout (a new
-# codex/rules/ dir, say) takes effect immediately, without walking through
-# every package-install prompt to get there.
+# Re-sync symlinks/configs for whatever's ALREADY installed — never
+# selects everything, never installs anything new. install.sh's own
+# install-manifest.jsonl (one file, shared across profiles, each line
+# tagged "profile":"<profile>","item":"<item-key>" in that fixed order —
+# same file lib/common.sh's manifest_has_item() already reads) is the
+# single source of truth for "which items did a real install actually
+# choose on this machine" — this greps that file for the current
+# profile's distinct item keys and passes them straight through as
+# install.sh --only=<keys>, so a repo where you only ever selected
+# neovim+zshrc+git only ever re-syncs neovim+zshrc+git, never the other
+# nine items you deliberately left unchecked. install.sh's own
+# per-package/per-symlink idempotency (install_pkg_one checks before
+# installing; link_file/sync_config_overlay no-op when already correct)
+# is what makes this cheap to run any time — this just makes sure the
+# ITEM SELECTION itself stays honest too, not just the actions inside it.
 #
-# Deliberately skips the "env" bootstrap repo — it has no ITEM_KEYS/--all
-# checklist of its own (see env/install.sh's own usage text), and its one
-# symlink (bin/myenv) is already in place if this command is running at
-# all, since myenv only exists on $PATH once install.sh has put it there.
+# No manifest entries for a profile (never installed here, or it
+# predates install-manifest.jsonl) -> that repo is skipped with a
+# pointer to run install.sh yourself once, rather than ever guessing
+# --all as a fallback. Deliberately skips the "env" bootstrap repo — it
+# has no ITEM_KEYS/--only of its own, and its one symlink (bin/myenv)
+# is already in place if this command is running at all.
 cmd_link() {
   _require_repos || return 1
-  local repo dir ran=0
+  local manifest="$ENVCFG_HOME/install-manifest.jsonl"
+  local repo dir items ran=0
   for repo in "${REPOS[@]}"; do
     [[ "$repo" == "env" ]] && continue
     dir="$(repo_dir "$repo")"
@@ -293,16 +308,26 @@ cmd_link() {
       warn "  ${repo}: no install.sh found — skipping"
       continue
     fi
+    if [[ ! -f "$manifest" ]]; then
+      warn "  ${repo}: no install-manifest.jsonl under $ENVCFG_HOME — can't tell what was actually installed here. Run 'cd $dir && ./install.sh' yourself once (interactively, or with --only=...) so future 'myenv link' runs know what to re-sync."
+      continue
+    fi
+    items="$(grep -o "\"profile\":\"${repo}\",\"item\":\"[^\"]*\"" "$manifest" | sed -E 's/.*"item":"([^"]*)"/\1/' | sort -u | paste -sd, -)"
+    if [[ -z "$items" ]]; then
+      warn "  ${repo}: install-manifest.jsonl has no entries for this profile yet — nothing recorded as installed. Run 'cd $dir && ./install.sh' yourself first."
+      continue
+    fi
     header "== $repo =="
-    if ( cd "$dir" && bash install.sh --all ); then
+    say "  Re-syncing: $items"
+    if ( cd "$dir" && bash install.sh --only="$items" ); then
       say "  ${c_green}Re-synced.${c_reset}"
     else
-      warn "  install.sh --all exited non-zero for $repo — see output above."
+      warn "  install.sh --only=$items exited non-zero for $repo — see output above."
     fi
     ran=1
   done
   if (( ran == 0 )); then
-    say "Nothing to link — no profile repos (env-personal/env-professional) found under $ENVCFG_HOME."
+    say "Nothing to link."
   fi
   say ""
 }
