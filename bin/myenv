@@ -196,17 +196,34 @@ _read_lines() {
 new_remote_branches() {
   local dir="$1"
   local -a remote_names local_names
-  _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/remotes/origin | sed 's#^origin/##' | grep -v '^HEAD$' || true)
+  # Deliberately NOT piping for-each-ref through sed/grep to strip the
+  # "origin/" prefix and drop HEAD — a stray/leftover ref under
+  # refs/remotes/origin that's literally named "origin" (no slash, no
+  # branch component — seen in the wild, root cause unconfirmed but
+  # real) sailed straight through that pipeline: sed's 's#^origin/##'
+  # only strips when "origin/" is actually a prefix, so a bare "origin"
+  # entry passed through unchanged, wasn't "HEAD", and got printed as a
+  # fake "new branch" with no actual branch name. Doing the prefix
+  # check explicitly in bash below means anything that ISN'T shaped
+  # like "origin/<branch>" is skipped outright instead of silently
+  # surviving as garbage.
+  _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/remotes/origin || true)
   remote_names=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
   _read_lines < <(git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads || true)
   local_names=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
+  local r stripped l found
   for r in "${remote_names[@]:-}"; do
     [[ -z "$r" ]] && continue
-    local found=0
+    case "$r" in
+      origin/*) stripped="${r#origin/}" ;;
+      *) continue ;;
+    esac
+    [[ -z "$stripped" || "$stripped" == "HEAD" ]] && continue
+    found=0
     for l in "${local_names[@]:-}"; do
-      [[ "$r" == "$l" ]] && { found=1; break; }
+      [[ "$stripped" == "$l" ]] && { found=1; break; }
     done
-    (( found == 0 )) && printf '%s\n' "$r"
+    (( found == 0 )) && printf '%s\n' "$stripped"
   done
 }
 
