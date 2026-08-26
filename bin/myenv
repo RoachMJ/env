@@ -87,6 +87,11 @@ Usage:
                        from. No "update everything" step.
                        Pass a branch name to scope everything to just that
                        one branch across all repos.
+                       If applying an update would be blocked by uncommitted
+                       local changes, shows only the added lines (not a full
+                       diff) and asks: port eligible lines to that file's
+                       .local overlay (created on demand), stash, discard, or
+                       abort — never silently drops or clobbers anything.
   myenv version        one-line version summary per repo (no color, no prompts)
   myenv link           re-sync ONLY items already installed (reads
                        install-manifest.jsonl per profile, re-runs just
@@ -394,6 +399,172 @@ repo_update_options() {
   done
 }
 
+# _overlay_for_file <repo-relative-path> -> "label|overlay-path" for a
+# known tracked config file that has a per-machine .local overlay slot
+# already wired (see each file's own header comment for the
+# include/dofile mechanism), or empty for anything else. These are
+# exactly the files a real user is likeliest to hand-edit live and then
+# get blindsided by an update clobbering — everything else just falls
+# through to the plain stash/discard/abort prompt below.
+_overlay_for_file() {
+  case "$1" in
+    shell/zshrc) printf 'zshrc|%s\n' "$HOME/.zshrc.local" ;;
+    git-config/gitconfig) printf 'gitconfig|%s\n' "$HOME/.gitconfig.local" ;;
+    nvim/init.lua) printf 'init.lua|%s\n' "$HOME/.config/nvim/init.local.lua" ;;
+    tmux/tmux.conf.local) printf 'tmux.conf.local|%s\n' "$HOME/.tmux.conf.user" ;;
+    *) printf '\n' ;;
+  esac
+}
+
+# _overlay_template <overlay-path> -> a minimal starter header for a
+# brand-new overlay file, in that format's own comment syntax. Only
+# used the first time a given overlay is created — an existing one is
+# only ever appended to, never rewritten.
+_overlay_template() {
+  case "$1" in
+    *.lua)
+      cat <<'EOF'
+-- Local machine overlay, created by `myenv update` to hold lines it
+-- ported out of a tracked file that had uncommitted local changes.
+-- Never symlinked, never git-tracked — yours to keep editing.
+EOF
+      ;;
+    *)
+      cat <<'EOF'
+# Local machine overlay, created by `myenv update` to hold lines it
+# ported out of a tracked file that had uncommitted local changes.
+# Never symlinked, never git-tracked — yours to keep editing.
+EOF
+      ;;
+  esac
+}
+
+# _new_lines_only <dir> <file> -> just the added-line content (diff
+# markup and leading '+' stripped, context/removed lines dropped) for
+# whatever's currently uncommitted in <file> vs HEAD. This is both what
+# gets shown to the user and exactly what gets appended to an overlay
+# on request — same source, so what you're shown is what gets ported.
+_new_lines_only() {
+  # -E (ERE) on BOTH greps deliberately — in GNU grep's default BRE
+  # mode, a backslash-escaped \+ means the opposite of ERE (it becomes
+  # the "one or more" quantifier instead of a literal +), so an
+  # unescaped-in-ERE '^\+\+\+' without -E silently turns into "one or
+  # more leading +" and matches every added-content line too, not just
+  # the "+++ b/file" diff header — confirmed by testing this exact
+  # pattern before shipping it. -E on both sides keeps \+ meaning
+  # literal + consistently.
+  git -C "$1" diff HEAD -- "$2" | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^\+//'
+}
+
+# _resolve_dirty_before_update <dir> <target> -> 0 if it's safe to run
+# `git merge --ff-only origin/<target>` (working tree was already
+# clean, or the user resolved whatever was dirty), 1 if they chose to
+# abort — caller must skip the merge entirely in that case, leaving the
+# repo untouched. Only called for the target==branch case below — the
+# other branch (fetch origin b:b) never touches a working tree, so a
+# dirty file can't block it in the first place.
+_resolve_dirty_before_update() {
+  local dir="$1" target="$2"
+  local -a dirty=()
+  _read_lines < <(git -C "$dir" diff --name-only HEAD 2>/dev/null)
+  dirty=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
+  (( ${#dirty[@]} == 0 )) && return 0
+
+  warn "  Local changes would block updating $target:"
+  local -a overlay_eligible=() f
+  for f in "${dirty[@]}"; do
+    say "  -- $f --"
+    local addedline
+    while IFS= read -r addedline; do
+      [[ -z "$addedline" ]] && continue
+      say "    + $addedline"
+    done < <(_new_lines_only "$dir" "$f")
+
+    local ov ovpath
+    ov="$(_overlay_for_file "$f")"
+    if [[ -n "$ov" ]]; then
+      ovpath="${ov#*|}"
+      warn "    Tracked file with a local override slot ($ovpath) —"
+      warn "    edits here get silently clobbered by every future update."
+      overlay_eligible+=("$f")
+    fi
+  done
+
+  local prompt
+  if (( ${#overlay_eligible[@]} > 0 )); then
+    prompt="  [p]ort eligible line(s) to local overlay and continue, [s]tash and continue, [d]iscard and continue, [a]bort update: "
+  else
+    prompt="  [s]tash and continue, [d]iscard and continue, [a]bort update: "
+  fi
+  local choice
+  read -r -p "$prompt" choice
+  case "$choice" in
+    p | P)
+      if (( ${#overlay_eligible[@]} == 0 )); then
+        warn "  Nothing eligible to port — aborting."
+        return 1
+      fi
+      for f in "${overlay_eligible[@]}"; do
+        ov="$(_overlay_for_file "$f")"
+        ovpath="${ov#*|}"
+        if [[ ! -f "$ovpath" ]]; then
+          mkdir -p "$(dirname "$ovpath")"
+          _overlay_template "$ovpath" >"$ovpath"
+          say "  Created $ovpath"
+        fi
+        {
+          printf '\n# --- ported from %s by myenv update, %s ---\n' "$f" "$(date '+%Y-%m-%d %H:%M')"
+          _new_lines_only "$dir" "$f"
+        } >>"$ovpath"
+        git -C "$dir" checkout -- "$f"
+        say "  Ported $f -> $ovpath, reverted the tracked copy."
+      done
+      local -a remaining=() matched e
+      for f in "${dirty[@]}"; do
+        matched=0
+        for e in "${overlay_eligible[@]:-}"; do
+          [[ "$e" == "$f" ]] && { matched=1; break; }
+        done
+        (( matched == 0 )) && remaining+=("$f")
+      done
+      if (( ${#remaining[@]} > 0 )); then
+        warn "  Remaining local change(s) with no overlay slot: ${remaining[*]}"
+        local choice2
+        read -r -p "  [s]tash and continue, [d]iscard and continue, [a]bort update: " choice2
+        case "$choice2" in
+          s | S)
+            git -C "$dir" stash push -u -m "myenv-update-$(date +%s)" -- "${remaining[@]}"
+            say "  Stashed. Run 'git -C $dir stash pop' afterward to reapply (may need manual conflict resolution)."
+            ;;
+          d | D)
+            git -C "$dir" checkout -- "${remaining[@]}"
+            say "  Discarded."
+            ;;
+          *)
+            warn "  Aborting update for $target."
+            return 1
+            ;;
+        esac
+      fi
+      return 0
+      ;;
+    s | S)
+      git -C "$dir" stash push -u -m "myenv-update-$(date +%s)" -- "${dirty[@]}"
+      say "  Stashed. Run 'git -C $dir stash pop' afterward to reapply (may need manual conflict resolution)."
+      return 0
+      ;;
+    d | D)
+      git -C "$dir" checkout -- "${dirty[@]}"
+      say "  Discarded."
+      return 0
+      ;;
+    *)
+      warn "  Aborting update for $target."
+      return 1
+      ;;
+  esac
+}
+
 # _apply_update <dir> <current-branch> <target-branch> — the only two
 # actions this CLI ever takes on a repo: fast-forward the branch you're
 # already on (git merge --ff-only, refuses on its own if it wouldn't be
@@ -405,6 +576,10 @@ repo_update_options() {
 _apply_update() {
   local dir="$1" branch="$2" target="$3"
   if [[ "$target" == "$branch" ]]; then
+    if ! _resolve_dirty_before_update "$dir" "$target"; then
+      warn "  Update aborted for $target — nothing changed."
+      return 0
+    fi
     if git -C "$dir" merge --ff-only "origin/$target" 2>&1; then
       say "  ${c_green}Updated $target.${c_reset}"
     else
