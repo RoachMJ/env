@@ -140,8 +140,8 @@ ls -la ~/.githelpers/git-hooks/           # expect: prepare-commit-msg, pre-comm
 ```bash
 mkdir -p /tmp/lint-smoke-test && cd /tmp/lint-smoke-test && git init -q
 printf '{"a":1,' > bad.json && git add bad.json
-git commit -m test                        # expect: blocked, jq error shown
-SKIP_LINT=1 git commit -m test            # expect: succeeds
+git commit -m test                        # expect: blocked, jq error shown (or prompts y/N in a TTY)
+git commit -m test --no-verify            # expect: succeeds (bypasses every hook)
 cd /tmp && rm -rf lint-smoke-test
 ```
 
@@ -259,7 +259,7 @@ Follow-on commits on an already-open MR/PR: plain `git push`, not `git mr push`/
 | Hook | Fires on | Does | Bypass |
 |---|---|---|---|
 | `prepare-commit-msg` | editor-based `git commit` | mrmeta label/milestone/assignee picker | `SKIP_MRMETA=1 git commit` |
-| `pre-commit` | every `git commit` | formats + lints staged files, gitleaks secret scan | `SKIP_LINT=1 git commit` |
+| `pre-commit` | every `git commit` | formats + lints staged files, gitleaks secret scan | interactive prompt on failure (TTY), or `--no-verify` |
 | both | — | — | `git commit --no-verify` |
 
 </details>
