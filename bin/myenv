@@ -83,8 +83,11 @@ Usage:
                        Otherwise walks repo by repo: states what was found
                        ("Found N new branch(es)/update(s) in <repo>"), asks
                        a single y/N (Enter = no, skip this repo), and only
-                       on yes shows the specific branch/tag options to pick
-                       from. No "update everything" step.
+                       on yes asks whether to set a [b]ranch or a [t]ag
+                       (skipped when only one kind exists), then lists
+                       numbered options for that kind. A tag is a plain
+                       detached checkout of that release. No "update
+                       everything" step.
                        Pass a branch name to scope everything to just that
                        one branch across all repos.
                        If applying an update would be blocked by uncommitted
@@ -287,6 +290,7 @@ cmd_status() {
   for repo in "${REPOS[@]}"; do
     local dir; dir="$(repo_dir "$repo")"
     git -C "$dir" fetch --quiet 2>/dev/null || true
+    _fetch_tags "$dir"
     print_repo_status "$repo"
   done
   say ""
@@ -359,6 +363,43 @@ cmd_link() {
   say ""
 }
 
+# _fetch_tags <dir> — best-effort `git fetch --tags`, deliberately
+# SEPARATE from (and never fatal to) the main fetch. A plain fetch only
+# auto-follows tags that point at objects it's downloading anyway, so a
+# release tag on a commit you already have (or on another branch) would
+# never show up. Kept non-fatal because --tags refuses to overwrite a
+# local tag that differs from the remote's same-named one (e.g. you
+# retagged locally, unpushed) — git still fetches every OTHER tag and
+# just reports the clash, and that must not be mistaken for the repo
+# being unreachable.
+_fetch_tags() {
+  git -C "$1" fetch --quiet --tags >/dev/null 2>&1 || true
+}
+
+# new_tags <dir> -> one "TAG|SUBJECT" per line, newest version first:
+# every tag whose commit is NOT already contained in HEAD (i.e. a
+# release you don't have yet). Tags at/behind your current commit are
+# omitted — those aren't updates. SUBJECT is the tag message's first
+# line (the TL;DR headline), empty for lightweight tags.
+new_tags() {
+  local dir="$1" t subj
+  while IFS= read -r t; do
+    [[ -z "$t" ]] && continue
+    subj="$(git -C "$dir" for-each-ref --format='%(contents:subject)' "refs/tags/$t" 2>/dev/null)"
+    printf '%s|%s\n' "$t" "$subj"
+  done < <(git -C "$dir" tag --no-merged HEAD --sort=-v:refname 2>/dev/null)
+}
+
+# _print_tag_notes <dir> <tag> — the tag message body (everything after
+# the headline line), indented and dimmed, so the TL;DR is visible right
+# where you pick a release. Prints nothing for lightweight tags.
+_print_tag_notes() {
+  local dir="$1" tag="$2" line
+  while IFS= read -r line; do
+    say "        ${c_dim}${line}${c_reset}"
+  done < <(git -C "$dir" for-each-ref --format='%(contents:body)' "refs/tags/$tag" 2>/dev/null | sed '/^$/d')
+}
+
 # repo_update_options <dir> <branch> [only-branch] -> one option per line,
 # "TYPE|TARGET|LABEL" (pipe-delimited — TARGET is a plain branch name,
 # never contains a pipe, so this is safe to split on). TYPE is
@@ -397,6 +438,41 @@ repo_update_options() {
     [[ -n "$upstream_tag" && "$upstream_tag" != "$current_tag" ]] && label="$label, includes new tag $upstream_tag"
     printf 'pending|%s|%s\n' "$b" "$label"
   done
+
+  # Releases (tags) you don't have yet. Skipped when scoped to a single
+  # branch — a branch scope means "only this branch", not releases.
+  if [[ -z "$only" ]]; then
+    local -a tag_list=()
+    _read_lines < <(new_tags "$dir")
+    tag_list=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
+    local te tname tsubj
+    for te in "${tag_list[@]:-}"; do
+      [[ -z "$te" ]] && continue
+      tname="${te%%|*}"
+      tsubj="${te#*|}"
+      printf 'tag|%s|%s\n' "$tname" "${tsubj:-release}"
+    done
+  fi
+}
+
+# _apply_tag <dir> <tag> — pin the working tree to a release: a plain
+# detached checkout of the tag. Same dirty-tree handling as a branch
+# update first (show added lines; port/stash/discard/abort), so
+# uncommitted edits are never silently lost. Detached HEAD means you're
+# on the release itself, not on any branch — `git switch -` or
+# `git switch <branch>` gets you back.
+_apply_tag() {
+  local dir="$1" tag="$2"
+  if ! _resolve_dirty_before_update "$dir" "$tag"; then
+    warn "  Checkout aborted for $tag — nothing changed."
+    return 0
+  fi
+  if git -C "$dir" checkout --detach "refs/tags/$tag" 2>&1; then
+    say "  ${c_green}Now on release $tag (detached HEAD).${c_reset}"
+    say "  ${c_dim}Back to a branch any time: git -C $dir switch <branch>${c_reset}"
+  else
+    warn "  Couldn't check out $tag — see output above."
+  fi
 }
 
 # _overlay_for_file <repo-relative-path> -> "label|overlay-path" for a
@@ -623,6 +699,7 @@ cmd_update() {
       fi
       continue
     fi
+    _fetch_tags "$dir"
     branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
     local -a opts=()
     _read_lines < <(repo_update_options "$dir" "$branch" "$only_branch")
@@ -661,7 +738,7 @@ cmd_update() {
     _read_lines < <(repo_update_options "$dir" "$branch" "$only_branch")
     opts=("${_read_lines_result[@]+"${_read_lines_result[@]}"}")
 
-    local n_new=0 n_pending=0 has_tag=0
+    local n_new=0 n_pending=0 n_tags=0 has_tag=0
     local o type
     for o in "${opts[@]:-}"; do
       [[ -z "$o" ]] && continue
@@ -672,6 +749,7 @@ cmd_update() {
           n_pending=$((n_pending + 1))
           [[ "$o" == *"includes new tag"* ]] && has_tag=1
           ;;
+        tag) n_tags=$((n_tags + 1)) ;;
       esac
     done
 
@@ -682,7 +760,9 @@ cmd_update() {
     if (( n_pending > 0 )); then
       found_bits+=("${n_pending} branch update$([[ $n_pending -ne 1 ]] && echo s || true)")
     fi
-    if (( has_tag )); then
+    if (( n_tags > 0 )); then
+      found_bits+=("${n_tags} release tag$([[ $n_tags -ne 1 ]] && echo s || true)")
+    elif (( has_tag )); then
       found_bits+=("a new tag")
     fi
     local found_str
@@ -700,6 +780,8 @@ cmd_update() {
         type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
         if [[ "$type" == "pending" ]]; then
           say "    - $target: $label"
+        elif [[ "$type" == "tag" ]]; then
+          say "    - tag $target: $label"; _print_tag_notes "$dir" "$target"
         else
           say "    - $label"
         fi
@@ -716,16 +798,39 @@ cmd_update() {
         ;;
     esac
 
+    # Branch or tag? Only asked when BOTH kinds exist — if there's just
+    # one kind, go straight to its numbered list. Each list is numbered
+    # from 1 on its own.
+    local n_branch=$((n_new + n_pending)) kind=""
+    if (( n_branch > 0 && n_tags > 0 )); then
+      local kreply
+      read -r -p "  Set to a [b]ranch or a [t]ag? (Enter to skip): " kreply
+      case "$kreply" in
+        b | B) kind="branch" ;;
+        t | T) kind="tag" ;;
+        *)
+          say "  ${c_dim}Skipped.${c_reset}"
+          continue
+          ;;
+      esac
+    elif (( n_tags > 0 )); then
+      kind="tag"
+    else
+      kind="branch"
+    fi
+
     local i=1 rest target label
     local -a menu_type=() menu_target=()
     for o in "${opts[@]:-}"; do
       [[ -z "$o" ]] && continue
       type="${o%%|*}"; rest="${o#*|}"; target="${rest%%|*}"; label="${rest#*|}"
-      if [[ "$type" == "pending" ]]; then
-        say "    [$i] Update $target — $label"
-      else
-        say "    [$i] $label"
-      fi
+      if [[ "$kind" == "tag" && "$type" != "tag" ]]; then continue; fi
+      if [[ "$kind" == "branch" && "$type" == "tag" ]]; then continue; fi
+      case "$type" in
+        pending) say "    [$i] Update $target — $label" ;;
+        tag)     say "    [$i] Tag $target — $label"; _print_tag_notes "$dir" "$target" ;;
+        *)       say "    [$i] $label" ;;
+      esac
       menu_type+=("$type"); menu_target+=("$target")
       i=$((i + 1))
     done
@@ -734,6 +839,8 @@ cmd_update() {
       local idx=$((reply2 - 1))
       if [[ "${menu_type[$idx]}" == "pending" ]]; then
         _apply_update "$dir" "$branch" "${menu_target[$idx]}"
+      elif [[ "${menu_type[$idx]}" == "tag" ]]; then
+        _apply_tag "$dir" "${menu_target[$idx]}"
       elif git -C "$dir" checkout -b "${menu_target[$idx]}" "origin/${menu_target[$idx]}" 2>&1; then
         say "  ${c_green}Checked out ${menu_target[$idx]}${c_reset}"
       else
