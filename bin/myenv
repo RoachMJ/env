@@ -377,17 +377,24 @@ _fetch_tags() {
 }
 
 # new_tags <dir> -> one "TAG|SUBJECT" per line, newest version first:
-# every tag whose commit is NOT already contained in HEAD (i.e. a
-# release you don't have yet). Tags at/behind your current commit are
-# omitted — those aren't updates. SUBJECT is the tag message's first
-# line (the TL;DR headline), empty for lightweight tags.
+# every tag whose VERSION is above the highest tag already contained in
+# HEAD (i.e. a release newer than where you are). Tags at/below your
+# current version are omitted even if they aren't in your history (old
+# tags on a rewritten/abandoned branch). SUBJECT is the tag message's
+# first line (the TL;DR headline), empty for lightweight tags.
 new_tags() {
-  local dir="$1" t subj
+  local dir="$1" t subj cur
+  # Highest-version tag already contained in HEAD = "where you are".
+  # A tag is only an update if its VERSION is above that. Containment
+  # alone isn't enough: old tags can sit on a different/rewritten
+  # history, not contained in HEAD but still LOWER than what you have.
+  cur="$(git -C "$dir" tag --merged HEAD --sort=-v:refname 2>/dev/null | head -n1)"
   while IFS= read -r t; do
     [[ -z "$t" ]] && continue
+    [[ -n "$cur" && "$t" == "$cur" ]] && break
     subj="$(git -C "$dir" for-each-ref --format='%(contents:subject)' "refs/tags/$t" 2>/dev/null)"
     printf '%s|%s\n' "$t" "$subj"
-  done < <(git -C "$dir" tag --no-merged HEAD --sort=-v:refname 2>/dev/null)
+  done < <(git -C "$dir" tag --sort=-v:refname 2>/dev/null)
 }
 
 # _print_tag_notes <dir> <tag> — the tag message body (everything after
